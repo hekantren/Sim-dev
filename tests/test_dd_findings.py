@@ -182,6 +182,19 @@ def test_no_hidden_time_between_steps(app):
     assert s["Total_Downtime_Days"].iloc[0] == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize("mode,expected_wait_h", [(None, 0.0), ("Nearshore", 3.0), ("Offshore", 0.0)])
+def test_foundation_loading_uses_loading_weather(app, mode, expected_wait_h):
+    # Project waves are fine; the barge site is too rough for the first 3 hours.
+    project = _toy_weather([1.0] * 200)
+    barge = _toy_weather([3.0, 3.0, 3.0] + [1.0] * 197)
+    tl = _step_timeline([2.0]).assign(Loading_Weather=True)
+    _, _, s = app["simulate_weather_impacts_foundation"](
+        tl, project, None, None, transit_distance=1, transit_speed=1, simulations=1,
+        start_times=project["time"].to_numpy("datetime64[ns]")[:1],
+        barge_weather_df=barge, loading_mode=mode)
+    assert s["Total_Downtime_Days"].iloc[0] * 24 == pytest.approx(expected_wait_h)
+
+
 # --------------------------------------------------------------------------- #
 #  Finding 5: common random numbers - every case uses the same start dates
 # --------------------------------------------------------------------------- #

@@ -78,8 +78,10 @@ Pipeline per case (vessel × loading mode × phase):
    `simulate_sequential_wtg_weather` step through the timeline and wait for workable weather
    via `_workable_runs` + `_window_start`: a restricted step starts only when its limits hold for
    every hour it touches, and steps start at the exact previous finish time (no rounding). `Loading_Weather` rows use the loading-location
-   weather (yard wind-only / barge / project by loading mode). In the foundation phase loading
-   rows are not weather-restricted.
+   weather chosen by `_loading_weather` (yard wind-only / barge / project by loading mode), in
+   the foundation phase too; `simulate_weather_impacts_foundation` called without
+   `loading_mode` skips the weather check for loading rows (legacy behaviour).
+   `_prep_weather` cleans every weather frame the simulators use.
 6. **Output** — `build_project_summary`, `plot_*`, `build_simulation_excel_export`,
    `render_advanced_weather_intelligence`.
 

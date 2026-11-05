@@ -1106,13 +1106,38 @@ def _window_start(times, runs, start, dur_hours, max_wait_hours=5000):
     raise RuntimeError("Exceeded max_wait_hours.")
 
 
+def _prep_weather(df, with_waves=True):
+    """(times, wind, waves or None) from a weather frame, cleaned and time-sorted."""
+    wc = _find_col(df, _WAVE_HEIGHT_COLS, "wave height") if with_waves else None
+    cols = ["time", "Adjusted_Windspeed"] + ([wc] if wc else [])
+    w = df[cols].copy(); w["time"] = pd.to_datetime(w["time"], errors="coerce")
+    for c in cols[1:]:
+        w[c] = pd.to_numeric(w[c], errors="coerce")
+    w = w.dropna().sort_values("time").drop_duplicates(subset="time").reset_index(drop=True)
+    return (w["time"].to_numpy(dtype="datetime64[ns]"),
+            w["Adjusted_Windspeed"].to_numpy(dtype=float),
+            w[wc].to_numpy(dtype=float) if wc else None)
+
+
+def _loading_weather(loading_mode, project, barge_weather_df, yard_wind_df):
+    """(times, wind, waves, check_waves) for loading rows:
+    'Offshore' → project weather (wind + waves), 'Nearshore' → barge weather
+    (wind + waves), 'Yard' → yard weather (wind only)."""
+    if loading_mode == "Offshore":
+        return (*project, True)
+    if loading_mode == "Nearshore":
+        if barge_weather_df is None:
+            raise ValueError("Nearshore loading selected but no barge weather is available.")
+        return (*_prep_weather(barge_weather_df), True)
+    if yard_wind_df is None:
+        raise ValueError("Yard loading selected but no yard weather is available.")
+    return (*_prep_weather(yard_wind_df, with_waves=False), False)
+
+
 # ── Monopile timeline builder (with Loading + Installation phases) ───────────
 def build_mp_timeline(excel_src, sheet_name, carry_cap, total_units, htd=1/24):
     plan = _build_plan(_read_ops_sheet(excel_src, sheet_name), carry_cap, total_units)
-    out = _plan_to_timeline(plan, carry_cap, total_units, htd)
-    # Loading in port is not weather-checked in the foundation phase (yet).
-    out["Weather_Restricted"] = ~out["Loading_Weather"]
-    return out
+    return _plan_to_timeline(plan, carry_cap, total_units, htd)
 
 
 # ── Jacket timeline builder (no loading phase — barge-fed at project site) ───
@@ -1134,43 +1159,48 @@ def build_jacket_timeline(excel_src, sheet_name, total_units, htd=1/24):
 def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, sheet_name,
                                          transit_distance, transit_speed, simulations=1,
                                          eligible_indices=None, seed=42,
-                                         max_wait_hours=5000, htd=1/24, start_times=None):
-    """Project-site weather sim for foundation installation (MP or Jacket).
-    Same logic as the original simulate_weather_impacts_mp — both sheet styles
-    share the same column shape (N / Seq Dur / Tr / Transit / Oplim Wave / Oplim Wind).
+                                         max_wait_hours=5000, htd=1/24, start_times=None,
+                                         barge_weather_df=None, yard_wind_df=None,
+                                         loading_mode=None):
+    """Weather sim for foundation installation (MP or Jacket).
     Durations and limits come from the timeline rows; excel_src / sheet_name are
     kept for call compatibility.  start_times (from draw_start_times) should be
-    shared by all cases; without it they are drawn from eligible_indices."""
+    shared by all cases; without it they are drawn from eligible_indices.
+
+    Weather routing (same rule as the WTG sims):
+      • Loading_Weather rows → loading-location weather by loading_mode
+        ('Yard' wind only, 'Nearshore' barge, 'Offshore' project).  Without a
+        loading_mode they are not weather-checked.
+      • All other weather-restricted rows → PROJECT weather (wind + waves)
+    """
     transit_hours = float(transit_distance) / float(transit_speed)
     base = timeline_df[["N", "Sequence", "Inventory", "WTG_Left", "Cycles_Left",
                         "Weather_Restricted", "Phase"]].copy()
     base["Sequence"] = base["Sequence"].astype(int)
     base["Weather_Restricted"] = base["Weather_Restricted"].astype(bool)
 
-    wave_col = _find_col(weather_df, _WAVE_HEIGHT_COLS, "wave height")
-    w = weather_df[["time", wave_col, "Adjusted_Windspeed"]].copy()
-    w["time"] = pd.to_datetime(w["time"], errors="coerce")
-    for c in [wave_col, "Adjusted_Windspeed"]:
-        w[c] = pd.to_numeric(w[c], errors="coerce")
-    w = w.dropna().sort_values("time").drop_duplicates(subset="time").reset_index(drop=True)
-    wt  = w["time"].to_numpy(dtype="datetime64[ns]")
-    ww  = w[wave_col].to_numpy(dtype=float)
-    wnd = w["Adjusted_Windspeed"].to_numpy(dtype=float)
+    wt, wnd, ww = _prep_weather(weather_df)
+    if loading_mode is not None:
+        lt, lnd, lw, loading_check_waves = _loading_weather(
+            loading_mode, (wt, wnd, ww), barge_weather_df, yard_wind_df)
     if start_times is None:
         eli = eligible_indices if eligible_indices is not None else np.arange(len(wt))
         start_times = draw_start_times(wt, eli, simulations, seed)
     rng = np.random.default_rng([seed, 1]); n = len(base)     # durations only
     tot_m = np.zeros((n, simulations), dtype=np.float32)
     dwn_m = np.zeros((n, simulations), dtype=np.float32)
-    sl, sh, swl, swd, sit, _ = _timeline_step_arrays(timeline_df, transit_hours)
+    sl, sh, swl, swd, sit, s_is_loading = _timeline_step_arrays(timeline_df, transit_hours)
     swx = base["Weather_Restricted"].to_numpy(dtype=bool)
+    if loading_mode is None:
+        swx = swx & ~s_is_loading
 
     runs_cache = {}
 
-    def wait(start, wlim, wndlim, dur):
-        if (wlim, wndlim) not in runs_cache:
-            runs_cache[(wlim, wndlim)] = _workable_runs(wt, wnd, ww, wlim, wndlim)
-        return _window_start(wt, runs_cache[(wlim, wndlim)], start, dur, max_wait_hours)
+    def _wait(times, winds, waves, start, wlim, wndlim, check_w, dur):
+        key = (id(times), wlim, wndlim, check_w)
+        if key not in runs_cache:
+            runs_cache[key] = _workable_runs(times, winds, waves, wlim, wndlim, check_w)
+        return _window_start(times, runs_cache[key], start, dur, max_wait_hours)
 
     summ = []
     for si in range(simulations):
@@ -1178,10 +1208,12 @@ def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, shee
         ss = ct; ta = td = 0.0
         for ri in range(n):
             ah = transit_hours if sit[ri] else float(rng.uniform(sl[ri], sh[ri]))
-            if swx[ri]:
-                dh, op_s = wait(ct, swl[ri], swd[ri], ah)
-            else:
+            if not swx[ri]:
                 dh, op_s = 0.0, ct
+            elif s_is_loading[ri]:
+                dh, op_s = _wait(lt, lnd, lw, ct, swl[ri], swd[ri], loading_check_waves, ah)
+            else:
+                dh, op_s = _wait(wt, wnd, ww, ct, swl[ri], swd[ri], True, ah)
             tot_m[ri, si] = (dh + ah) * htd
             dwn_m[ri, si] = dh * htd
             ta += ah; td += dh
@@ -1298,43 +1330,10 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
     base["Sequence"] = pd.to_numeric(base["Sequence"], errors="coerce").astype(int)
     sl, sh, swl, swd, sit, s_is_loading = _timeline_step_arrays(timeline_df, transit_hours)
 
-    wave_col = _find_col(project_weather_df, _WAVE_HEIGHT_COLS, "wave height")
-
-    def prep(df, cols):
-        df = df[list(cols)].copy(); df["time"] = pd.to_datetime(df["time"], errors="coerce")
-        for c in cols:
-            if c != "time": df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df.dropna().sort_values("time").drop_duplicates(subset="time").reset_index(drop=True)
-
-    # Project weather (installation + transit, and offshore loading).
-    wp = prep(project_weather_df, {"time", wave_col, "Adjusted_Windspeed"})
-    pt  = wp["time"].to_numpy(dtype="datetime64[ns]")
-    pw  = wp[wave_col].to_numpy(dtype=float)
-    pnd = wp["Adjusted_Windspeed"].to_numpy(dtype=float)
-
-    # Loading-location weather dataset depends on loading_mode.
-    if loading_mode == "Offshore":
-        # Loaded at the project site → wind + waves (reuse project arrays).
-        lt, lnd, lw_waves, loading_check_waves = pt, pnd, pw, True
-    elif loading_mode == "Nearshore":
-        # Loaded at the barge site → wind + waves.
-        if barge_weather_df is None:
-            raise ValueError("Nearshore loading selected but no barge weather is available.")
-        bwave_col = _find_col(barge_weather_df, _WAVE_HEIGHT_COLS, "wave height")
-        wb = prep(barge_weather_df, {"time", bwave_col, "Adjusted_Windspeed"})
-        lt       = wb["time"].to_numpy(dtype="datetime64[ns]")
-        lnd      = wb["Adjusted_Windspeed"].to_numpy(dtype=float)
-        lw_waves = wb[bwave_col].to_numpy(dtype=float)
-        loading_check_waves = True
-    else:  # "Yard"
-        # Loaded at the yard → WIND ONLY.
-        if yard_wind_df is None:
-            raise ValueError("Yard loading selected but no yard weather is available.")
-        wy = prep(yard_wind_df, {"time", "Adjusted_Windspeed"})
-        lt       = wy["time"].to_numpy(dtype="datetime64[ns]")
-        lnd      = wy["Adjusted_Windspeed"].to_numpy(dtype=float)
-        lw_waves = None
-        loading_check_waves = False
+    # Project weather (installation + transit); loading weather by loading_mode.
+    pt, pnd, pw = _prep_weather(project_weather_df)
+    lt, lnd, lw_waves, loading_check_waves = _loading_weather(
+        loading_mode, (pt, pnd, pw), barge_weather_df, yard_wind_df)
 
     if start_times is None:
         eli = eligible_indices if eligible_indices is not None else np.arange(len(pt))
@@ -1400,39 +1399,10 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
     base = timeline_df[["N", "Sequence", "Inventory", "WTG_Left", "Cycles_Left"]].copy()
     base["Sequence"] = pd.to_numeric(base["Sequence"], errors="coerce").astype(int)
 
-    def prep_ww(df):
-        wc = _find_col(df, _WAVE_HEIGHT_COLS, "wave height")
-        w = df[["time", wc, "Adjusted_Windspeed"]].copy()
-        w["time"] = pd.to_datetime(w["time"], errors="coerce")
-        for c in [wc, "Adjusted_Windspeed"]:
-            w[c] = pd.to_numeric(w[c], errors="coerce")
-        w = w.dropna().sort_values("time").drop_duplicates(subset="time").reset_index(drop=True)
-        return (w["time"].to_numpy(dtype="datetime64[ns]"),
-                w["Adjusted_Windspeed"].to_numpy(dtype=float),
-                w[wc].to_numpy(dtype=float))
-
-    def prep_wind(df):
-        w = df[["time", "Adjusted_Windspeed"]].copy()
-        w["time"] = pd.to_datetime(w["time"], errors="coerce")
-        w["Adjusted_Windspeed"] = pd.to_numeric(w["Adjusted_Windspeed"], errors="coerce")
-        w = w.dropna().sort_values("time").drop_duplicates(subset="time").reset_index(drop=True)
-        return (w["time"].to_numpy(dtype="datetime64[ns]"),
-                w["Adjusted_Windspeed"].to_numpy(dtype=float), None)
-
-    # Project arrays (installation + transit).
-    pt, pnd, pw = prep_ww(project_weather_df)
-
-    # Loading-location arrays per mode.
-    if loading_mode == "Offshore":
-        lt, lnd, lw, loading_check_waves = pt, pnd, pw, True
-    elif loading_mode == "Nearshore":
-        if barge_weather_df is None:
-            raise ValueError("Nearshore loading selected but no barge weather is available.")
-        lt, lnd, lw = prep_ww(barge_weather_df); loading_check_waves = True
-    else:  # Yard → wind only
-        if yard_wind_df is None:
-            raise ValueError("Yard loading selected but no yard weather is available.")
-        lt, lnd, lw = prep_wind(yard_wind_df); loading_check_waves = False
+    # Project arrays (installation + transit); loading arrays by loading_mode.
+    pt, pnd, pw = _prep_weather(project_weather_df)
+    lt, lnd, lw, loading_check_waves = _loading_weather(
+        loading_mode, (pt, pnd, pw), barge_weather_df, yard_wind_df)
 
     if start_times is None:
         eli = eligible_indices if eligible_indices is not None else np.arange(len(pt))
@@ -2181,7 +2151,9 @@ else:
                             io.BytesIO(excel_bytes), sheet,
                             transit_distance=td, transit_speed=spd,
                             simulations=int(Simulations),
-                            start_times=sim_start_times, htd=htd)
+                            start_times=sim_start_times, htd=htd,
+                            barge_weather_df=df_barge_weather, yard_wind_df=df_yard_wind,
+                            loading_mode=mode)
                         foundation_results[label] = {
                             "vessel": vessel, "mode": mode,
                             "timeline": tl, "total": tot,
