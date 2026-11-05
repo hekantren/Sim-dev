@@ -31,7 +31,17 @@ python dd\era5_morven_download.py --list
 python dd\metocean_screening.py era5_morven\morven_north.zip --out screening_north --hub 150
 ```
 
-There is no linter or test suite configured yet.
+Tests (`python -m pip install pytest`; need the local workbook, otherwise they skip):
+
+```powershell
+python -m pytest tests -q -rA
+python -m pytest tests -q -k "W90 MP"                     # one sheet
+python -m pytest "tests/test_dd_findings.py::test_start_date_day_first"
+```
+
+`tests/test_dd_findings.py` checks the app against `dd/sim_reference.py`. `test_reference_*` must
+always pass; the other tests encode the DD findings and fail until each fix is ported. No linter is
+configured.
 
 ## Architecture of the app
 
