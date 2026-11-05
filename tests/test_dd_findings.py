@@ -136,3 +136,42 @@ def test_start_date_day_first(app):
     idx = app["get_seasonal_eligible_indices"](times, "1-7-2027")
     months = set(pd.DatetimeIndex(times[idx]).month)
     assert months <= {6, 7}, f"'1-7-2027' should mean 1 July, eligible months were {sorted(months)}"
+
+
+# --------------------------------------------------------------------------- #
+#  Finding 4: weather limits must hold for the whole operation (persistence)
+# --------------------------------------------------------------------------- #
+def _step_timeline(durations, wave_lim=2.0):
+    n = len(durations)
+    return pd.DataFrame({
+        "N": range(1, n + 1), "Sequence": range(1, n + 1), "Inventory": 0, "WTG_Left": 0,
+        "Cycles_Left": 0, "Weather_Restricted": True, "Phase": "installation",
+        "Transit": False, "Lo_Hours": durations, "Hi_Hours": durations,
+        "Wave_Limit": wave_lim, "Wind_Limit": np.inf, "Loading_Weather": False})
+
+
+def _toy_weather(hs):
+    t = pd.date_range("2030-01-01", periods=len(hs), freq="h")
+    return pd.DataFrame({"time": t, "swh": hs, "Adjusted_Windspeed": 5.0})
+
+
+def test_weather_window_covers_whole_step(app):
+    # Hs is fine at the start hour but exceeds the limit in hours 1-2: a 3 h step
+    # must wait for hours 3-5 instead of starting at hour 0.
+    wx = _toy_weather([1.0, 3.0, 3.0] + [1.0] * 200)
+    _, dwn, s = app["simulate_weather_impacts_foundation"](
+        _step_timeline([3.0]), wx, None, None, transit_distance=1, transit_speed=1,
+        simulations=1, eligible_indices=np.array([0]))
+    assert s["Total_Downtime_Days"].iloc[0] * 24 == pytest.approx(3.0)
+
+
+def test_no_hidden_time_between_steps(app):
+    # Fractional durations in good weather: the calendar span must equal the
+    # reported total (no silent rounding up to the next full hour per step).
+    wx = _toy_weather([1.0] * 200)
+    _, _, s = app["simulate_weather_impacts_foundation"](
+        _step_timeline([1.5, 1.5, 1.5]), wx, None, None, transit_distance=1, transit_speed=1,
+        simulations=1, eligible_indices=np.array([0]))
+    span_h = (s["Finish_Date"].iloc[0] - s["Start_Date"].iloc[0]) / pd.Timedelta(hours=1)
+    assert span_h == pytest.approx(s["Total_Project_Days"].iloc[0] * 24)
+    assert s["Total_Downtime_Days"].iloc[0] == pytest.approx(0.0)

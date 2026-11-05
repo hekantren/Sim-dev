@@ -1069,6 +1069,43 @@ def _add_duration_simulations(timeline_df, simulations, transit_hours, seed=42, 
                                        index=df.index)], axis=1)
 
 
+# ── Weather windows (persistence) ────────────────────────────────────────────
+# A weather-restricted step starts only when its limits hold for every hour the
+# step touches, not just the start hour.  runs[i] = consecutive workable hours
+# starting at hour i (a gap in the hourly series ends a run).
+def _workable_runs(times, winds, waves, wave_lim, wind_lim, check_waves=True):
+    ok = np.isfinite(winds) & (winds <= wind_lim)
+    if check_waves and waves is not None and np.isfinite(wave_lim):
+        ok &= np.isfinite(waves) & (waves <= wave_lim)
+    n = len(ok); pos = np.arange(n)
+    ends = np.full(n, n)
+    ends[~ok] = pos[~ok]
+    gap_after = np.flatnonzero(np.diff(times) > np.timedelta64(1, "h"))
+    ends[gap_after] = np.minimum(ends[gap_after], gap_after + 1)
+    next_end = np.minimum.accumulate(ends[::-1])[::-1]
+    return (next_end - pos).astype(np.int64)
+
+
+def _window_start(times, runs, start, dur_hours, max_wait_hours=5000):
+    """(wait_hours, start_time) for a step of dur_hours beginning no earlier than start."""
+    t = np.datetime64(pd.Timestamp(start), "ns")
+    i0 = int(np.searchsorted(times, t, side="right")) - 1   # hour that contains t
+    if i0 < 0 or i0 + 1 >= len(times):
+        raise RuntimeError("Ran out of weather data.")
+    off = float((t - times[i0]) / np.timedelta64(1, "h"))
+    if off < 1.0 and runs[i0] >= max(1, math.ceil(off + dur_hours - 1e-9)):
+        return 0.0, pd.Timestamp(start)
+    need = max(1, math.ceil(dur_hours - 1e-9))
+    for span in (72, 720, max_wait_hours):
+        hit = np.flatnonzero(runs[i0 + 1:i0 + 1 + span] >= need)
+        if hit.size:
+            begin = pd.Timestamp(times[i0 + 1 + hit[0]])
+            return (begin - pd.Timestamp(start)) / pd.Timedelta(hours=1), begin
+    if i0 + 1 + max_wait_hours >= len(times):
+        raise RuntimeError("Ran out of weather data.")
+    raise RuntimeError("Exceeded max_wait_hours.")
+
+
 # ── Monopile timeline builder (with Loading + Installation phases) ───────────
 def build_mp_timeline(excel_src, sheet_name, carry_cap, total_units, htd=1/24):
     plan = _build_plan(_read_ops_sheet(excel_src, sheet_name), carry_cap, total_units)
@@ -1125,25 +1162,23 @@ def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, shee
     sl, sh, swl, swd, sit, _ = _timeline_step_arrays(timeline_df, transit_hours)
     swx = base["Weather_Restricted"].to_numpy(dtype=bool)
 
-    def wait(start, wlim, wndlim):
-        idx = int(np.searchsorted(wt, np.datetime64(pd.Timestamp(start)), side="left"))
-        for h in range(max_wait_hours + 1):
-            i = idx + h
-            if i >= len(wt): raise RuntimeError("Ran out of weather data.")
-            if ww[i] <= wlim and wnd[i] <= wndlim: return h, i
-        raise RuntimeError("Exceeded max_wait_hours.")
+    runs_cache = {}
+
+    def wait(start, wlim, wndlim, dur):
+        if (wlim, wndlim) not in runs_cache:
+            runs_cache[(wlim, wndlim)] = _workable_runs(wt, wnd, ww, wlim, wndlim)
+        return _window_start(wt, runs_cache[(wlim, wndlim)], start, dur, max_wait_hours)
 
     summ = []
     for si in range(simulations):
         ct = pd.Timestamp(wt[int(rng.choice(eli))])
         ss = ct; ta = td = 0.0
         for ri in range(n):
+            ah = transit_hours if sit[ri] else float(rng.uniform(sl[ri], sh[ri]))
             if swx[ri]:
-                dh, pi = wait(ct, swl[ri], swd[ri])
-                op_s = pd.Timestamp(wt[pi])
+                dh, op_s = wait(ct, swl[ri], swd[ri], ah)
             else:
                 dh, op_s = 0.0, ct
-            ah = transit_hours if sit[ri] else float(rng.uniform(sl[ri], sh[ri]))
             tot_m[ri, si] = (dh + ah) * htd
             dwn_m[ri, si] = dh * htd
             ta += ah; td += dh
@@ -1285,14 +1320,13 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
     tot_m = np.zeros((n, simulations), dtype=np.float32)
     dwn_m = np.zeros((n, simulations), dtype=np.float32)
 
-    def _wait(times, winds, waves, start, wlim, wndlim, check_w):
-        idx = int(np.searchsorted(times, np.datetime64(pd.Timestamp(start)), side="left"))
-        for h in range(max_wait_hours + 1):
-            i = idx + h
-            if i >= len(times): raise RuntimeError("Ran out of weather data.")
-            if winds[i] <= wndlim and (not check_w or waves[i] <= wlim):
-                return h, i
-        raise RuntimeError("Exceeded max_wait_hours.")
+    runs_cache = {}
+
+    def _wait(times, winds, waves, start, wlim, wndlim, check_w, dur):
+        key = (id(times), wlim, wndlim, check_w)
+        if key not in runs_cache:
+            runs_cache[key] = _workable_runs(times, winds, waves, wlim, wndlim, check_w)
+        return _window_start(times, runs_cache[key], start, dur, max_wait_hours)
 
     summ = []
     for si in range(simulations):
@@ -1300,13 +1334,11 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
         offset = float(mp_offset_days[si]) if mp_offset_days is not None else 0.0
         ct = bs + pd.Timedelta(days=offset); ss = ct; ta = td = 0.0
         for ri in range(n):
-            if s_is_loading[ri]:
-                dh, pi = _wait(lt, lnd, lw_waves, ct, swl[ri], swd[ri], loading_check_waves)
-                op_s = pd.Timestamp(lt[pi])
-            else:  # installation + transit → project weather
-                dh, pi = _wait(pt, pnd, pw, ct, swl[ri], swd[ri], True)
-                op_s = pd.Timestamp(pt[pi])
             ah = transit_hours if sit[ri] else float(rng.uniform(sl[ri], sh[ri]))
+            if s_is_loading[ri]:
+                dh, op_s = _wait(lt, lnd, lw_waves, ct, swl[ri], swd[ri], loading_check_waves, ah)
+            else:  # installation + transit → project weather
+                dh, op_s = _wait(pt, pnd, pw, ct, swl[ri], swd[ri], True, ah)
             tot_m[ri, si] = (dh + ah) * htd
             dwn_m[ri, si] = dh * htd
             ta += ah; td += dh
@@ -1386,14 +1418,13 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
     # uses project weather.
     sl, sh, swl, swd, sit, s_is_loading = _timeline_step_arrays(timeline_df, transit_hours)
 
-    def _wait(times, winds, waves, start, wlim, wndlim, check_w):
-        idx = int(np.searchsorted(times, np.datetime64(pd.Timestamp(start)), side="left"))
-        for h in range(max_wait_hours + 1):
-            i = idx + h
-            if i >= len(times): raise RuntimeError("Ran out of weather data.")
-            if winds[i] <= wndlim and (not check_w or waves[i] <= wlim):
-                return h, i
-        raise RuntimeError("Exceeded max_wait_hours.")
+    runs_cache = {}
+
+    def _wait(times, winds, waves, start, wlim, wndlim, check_w, dur):
+        key = (id(times), wlim, wndlim, check_w)
+        if key not in runs_cache:
+            runs_cache[key] = _workable_runs(times, winds, waves, wlim, wndlim, check_w)
+        return _window_start(times, runs_cache[key], start, dur, max_wait_hours)
 
     summ = []
     for si in range(simulations):
@@ -1401,13 +1432,11 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
         offset = float(mp_offset_days[si]) if mp_offset_days is not None else 0.0
         ct = bs + pd.Timedelta(days=offset); ss = ct; ta = td = 0.0
         for ri in range(n):
-            if s_is_loading[ri]:
-                dh, pi = _wait(lt, lnd, lw, ct, swl[ri], swd[ri], loading_check_waves)
-                op_s = pd.Timestamp(lt[pi])
-            else:
-                dh, pi = _wait(pt, pnd, pw, ct, swl[ri], swd[ri], True)
-                op_s = pd.Timestamp(pt[pi])
             ah = transit_hours if sit[ri] else float(rng.uniform(sl[ri], sh[ri]))
+            if s_is_loading[ri]:
+                dh, op_s = _wait(lt, lnd, lw, ct, swl[ri], swd[ri], loading_check_waves, ah)
+            else:
+                dh, op_s = _wait(pt, pnd, pw, ct, swl[ri], swd[ri], True, ah)
             tot_m[ri, si] = (dh + ah) * htd
             dwn_m[ri, si] = dh * htd
             ta += ah; td += dh
