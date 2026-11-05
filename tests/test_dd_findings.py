@@ -138,6 +138,11 @@ def test_start_date_day_first(app):
     assert months <= {6, 7}, f"'1-7-2027' should mean 1 July, eligible months were {sorted(months)}"
 
 
+@pytest.mark.parametrize("text", ["1-7-2027", "01.07.2027", "1/7/2027", "2027-07-01"])
+def test_parse_start_date_formats(app, text):
+    assert app["parse_start_date"](text) == pd.Timestamp("2027-07-01")
+
+
 # --------------------------------------------------------------------------- #
 #  Finding 4: weather limits must hold for the whole operation (persistence)
 # --------------------------------------------------------------------------- #

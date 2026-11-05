@@ -1196,9 +1196,18 @@ def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, shee
             pd.DataFrame(summ))
 
 
+def parse_start_date(s):
+    """'2027-07-01' (ISO) or '1-7-2027' / '01.07.2027' (day first) -> 1 July 2027.
+    pd.Timestamp('1-7-2027') would read month first (7 January)."""
+    s = str(s).strip()
+    if len(s) >= 8 and s[:4].isdigit() and s[4] in "-/.":
+        return pd.Timestamp(s)
+    return pd.to_datetime(s, dayfirst=True)
+
+
 def get_seasonal_eligible_indices(weather_times, start_date_str,
                                    window_days=7, latest_start="2022-12-31 23:00:00"):
-    target = pd.Timestamp(start_date_str)
+    target = parse_start_date(start_date_str)
     times_pd = pd.DatetimeIndex(weather_times); cutoff = pd.Timestamp(latest_start)
     doys = times_pd.day_of_year; tdoy = target.day_of_year
     circ = np.minimum(np.abs(doys - tdoy), 365 - np.abs(doys - tdoy))
@@ -2128,7 +2137,8 @@ else:
         wt_arr = df_project_weather["time"].to_numpy(dtype="datetime64[ns]")
         try:
             seasonal_eligible = get_seasonal_eligible_indices(wt_arr, Sim_start_date)
-            st.info(f"Seasonal eligible start timestamps: {len(seasonal_eligible):,}")
+            st.info(f"Start date read as {parse_start_date(Sim_start_date):%d %B} — "
+                    f"seasonal eligible start timestamps: {len(seasonal_eligible):,}")
         except Exception as e:
             st.error(f"Seasonal index error: {e}"); st.stop()
         # One set of start times for every case and both phases (common random
