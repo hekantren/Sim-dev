@@ -175,3 +175,31 @@ def test_no_hidden_time_between_steps(app):
     span_h = (s["Finish_Date"].iloc[0] - s["Start_Date"].iloc[0]) / pd.Timedelta(hours=1)
     assert span_h == pytest.approx(s["Total_Project_Days"].iloc[0] * 24)
     assert s["Total_Downtime_Days"].iloc[0] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+#  Finding 5: common random numbers - every case uses the same start dates
+# --------------------------------------------------------------------------- #
+def test_cases_share_start_dates(app):
+    wx = _toy_weather(np.where(np.arange(2000) % 50 < 40, 1.0, 3.0))
+    starts = app["draw_start_times"](wx["time"].to_numpy("datetime64[ns]"), np.arange(1000), 25, seed=42)
+    seen = []
+    for durations in ([3.0], [2.0, 5.0, 1.5, 4.0]):       # different cases, different draw counts
+        _, _, s = app["simulate_weather_impacts_foundation"](
+            _step_timeline(durations), wx, None, None, transit_distance=1, transit_speed=1,
+            simulations=25, start_times=starts)
+        seen.append(pd.to_datetime(s["Start_Date"]).to_numpy("datetime64[ns]"))
+    np.testing.assert_array_equal(seen[0], starts)
+    np.testing.assert_array_equal(seen[1], starts)
+
+
+def test_wtg_phase_continues_foundation_weather_history(app):
+    wx = _toy_weather([1.0] * 2000)
+    starts = wx["time"].to_numpy("datetime64[ns]")[[10, 200, 400]]
+    offset_days = np.array([1.0, 2.5, 4.0])
+    tl = _step_timeline([2.0]).drop(columns=["Weather_Restricted", "Phase"])
+    _, _, s = app["simulate_sequential_wtg_weather"](
+        tl, wx, None, None, None, None, transit_distance=1, transit_speed=1, simulations=3,
+        start_times=starts, mp_offset_days=offset_days, loading_mode="Offshore")
+    expected = pd.to_datetime(starts) + pd.to_timedelta(offset_days, unit="D")
+    np.testing.assert_array_equal(pd.to_datetime(s["WTG_Start_Date"]).to_numpy(), expected.to_numpy())

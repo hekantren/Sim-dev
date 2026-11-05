@@ -38,7 +38,7 @@ KEEP = {"_find_col", "_norm_marker", "_norm_bool", "_resolve_sheet_name", "_exce
         "simulate_weather_impacts_w90", "simulate_sequential_wtg_weather", "_sim_totals",
         "_read_ops_sheet", "_sheet_blocks", "_plan_step", "_build_plan", "_plan_to_timeline",
         "_timeline_step_arrays", "_add_duration_simulations", "_wtg_plan_overrides",
-        "_workable_runs", "_window_start"}
+        "_workable_runs", "_window_start", "draw_start_times"}
 CONSTS = {"_TIME_COLS", "_U_COLS", "_V_COLS", "_WAVE_MARKERS", "_WIND_MARKERS", "_DROP_COLS",
           "_WAVE_HEIGHT_COLS", "_PLAN_OVERRIDES"}
 

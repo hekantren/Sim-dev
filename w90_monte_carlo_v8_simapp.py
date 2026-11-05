@@ -1134,12 +1134,13 @@ def build_jacket_timeline(excel_src, sheet_name, total_units, htd=1/24):
 def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, sheet_name,
                                          transit_distance, transit_speed, simulations=1,
                                          eligible_indices=None, seed=42,
-                                         max_wait_hours=5000, htd=1/24):
+                                         max_wait_hours=5000, htd=1/24, start_times=None):
     """Project-site weather sim for foundation installation (MP or Jacket).
     Same logic as the original simulate_weather_impacts_mp — both sheet styles
     share the same column shape (N / Seq Dur / Tr / Transit / Oplim Wave / Oplim Wind).
     Durations and limits come from the timeline rows; excel_src / sheet_name are
-    kept for call compatibility."""
+    kept for call compatibility.  start_times (from draw_start_times) should be
+    shared by all cases; without it they are drawn from eligible_indices."""
     transit_hours = float(transit_distance) / float(transit_speed)
     base = timeline_df[["N", "Sequence", "Inventory", "WTG_Left", "Cycles_Left",
                         "Weather_Restricted", "Phase"]].copy()
@@ -1155,8 +1156,10 @@ def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, shee
     wt  = w["time"].to_numpy(dtype="datetime64[ns]")
     ww  = w[wave_col].to_numpy(dtype=float)
     wnd = w["Adjusted_Windspeed"].to_numpy(dtype=float)
-    eli = eligible_indices if eligible_indices is not None else np.arange(len(wt))
-    rng = np.random.default_rng(seed); n = len(base)
+    if start_times is None:
+        eli = eligible_indices if eligible_indices is not None else np.arange(len(wt))
+        start_times = draw_start_times(wt, eli, simulations, seed)
+    rng = np.random.default_rng([seed, 1]); n = len(base)     # durations only
     tot_m = np.zeros((n, simulations), dtype=np.float32)
     dwn_m = np.zeros((n, simulations), dtype=np.float32)
     sl, sh, swl, swd, sit, _ = _timeline_step_arrays(timeline_df, transit_hours)
@@ -1171,7 +1174,7 @@ def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, shee
 
     summ = []
     for si in range(simulations):
-        ct = pd.Timestamp(wt[int(rng.choice(eli))])
+        ct = pd.Timestamp(start_times[si])
         ss = ct; ta = td = 0.0
         for ri in range(n):
             ah = transit_hours if sit[ri] else float(rng.uniform(sl[ri], sh[ri]))
@@ -1203,6 +1206,15 @@ def get_seasonal_eligible_indices(weather_times, start_date_str,
     if len(eligible) == 0:
         raise ValueError(f"No eligible starts near {target.strftime('%d %B')}.")
     return eligible
+
+
+def draw_start_times(weather_times, eligible_indices, simulations, seed=42):
+    """Draw the simulation start times ONCE so every case (and both phases of a
+    combined case) is simulated on the same weather histories.  Durations use
+    their own random stream inside each simulator."""
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(np.asarray(eligible_indices), size=int(simulations), replace=True)
+    return np.asarray(weather_times, dtype="datetime64[ns]")[idx]
 
 
 def _wtg_plan_overrides(sheet_name, vessel):
@@ -1256,7 +1268,7 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
                                   transit_distance, transit_speed,
                                   simulations=1, eligible_indices=None, seed=42,
                                   max_wait_hours=5000, htd=1/24, mp_offset_days=None,
-                                  loading_mode="Yard"):
+                                  loading_mode="Yard", start_times=None):
     """Weather sim for W90 WTG (v8 deterministic per-phase routing).
 
     Weather routing:
@@ -1315,8 +1327,10 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
         lw_waves = None
         loading_check_waves = False
 
-    eli = eligible_indices if eligible_indices is not None else np.arange(len(pt))
-    rng = np.random.default_rng(seed); n = len(base)
+    if start_times is None:
+        eli = eligible_indices if eligible_indices is not None else np.arange(len(pt))
+        start_times = draw_start_times(pt, eli, simulations, seed)
+    rng = np.random.default_rng([seed, 1]); n = len(base)     # durations only
     tot_m = np.zeros((n, simulations), dtype=np.float32)
     dwn_m = np.zeros((n, simulations), dtype=np.float32)
 
@@ -1330,7 +1344,7 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
 
     summ = []
     for si in range(simulations):
-        sidx = int(rng.choice(eli)); bs = pd.Timestamp(pt[sidx])
+        bs = pd.Timestamp(start_times[si])
         offset = float(mp_offset_days[si]) if mp_offset_days is not None else 0.0
         ct = bs + pd.Timedelta(days=offset); ss = ct; ta = td = 0.0
         for ri in range(n):
@@ -1359,7 +1373,8 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
                                      yard_wind_df, excel_src, sheet_name,
                                      transit_distance, transit_speed, simulations=1,
                                      eligible_indices=None, seed=42, max_wait_hours=5000,
-                                     htd=1/24, mp_offset_days=None, loading_mode="Yard"):
+                                     htd=1/24, mp_offset_days=None, loading_mode="Yard",
+                                     start_times=None):
     """Sequential WTG weather sim (JUV / FIV) with v8 per-phase weather routing.
 
     Weather routing (same rule as the W90 sim):
@@ -1410,8 +1425,10 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
             raise ValueError("Yard loading selected but no yard weather is available.")
         lt, lnd, lw = prep_wind(yard_wind_df); loading_check_waves = False
 
-    eli = eligible_indices if eligible_indices is not None else np.arange(len(pt))
-    rng = np.random.default_rng(seed); n = len(base)
+    if start_times is None:
+        eli = eligible_indices if eligible_indices is not None else np.arange(len(pt))
+        start_times = draw_start_times(pt, eli, simulations, seed)
+    rng = np.random.default_rng([seed, 1]); n = len(base)     # durations only
     tot_m = np.zeros((n, simulations), dtype=np.float32)
     dwn_m = np.zeros((n, simulations), dtype=np.float32)
     # Loading-weather rows use the loading-location dataset; everything else
@@ -1428,7 +1445,7 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
 
     summ = []
     for si in range(simulations):
-        sidx = int(rng.choice(eli)); bs = pd.Timestamp(pt[sidx])
+        bs = pd.Timestamp(start_times[si])
         offset = float(mp_offset_days[si]) if mp_offset_days is not None else 0.0
         ct = bs + pd.Timedelta(days=offset); ss = ct; ta = td = 0.0
         for ri in range(n):
@@ -2114,6 +2131,9 @@ else:
             st.info(f"Seasonal eligible start timestamps: {len(seasonal_eligible):,}")
         except Exception as e:
             st.error(f"Seasonal index error: {e}"); st.stop()
+        # One set of start times for every case and both phases (common random
+        # numbers): case differences then come from the cases, not the sampling.
+        sim_start_times = draw_start_times(wt_arr, seasonal_eligible, int(Simulations), seed=42)
 
         # ─────────────────────────────────────────────────────────────────
         #  SECTION 3 – Foundation simulations
@@ -2151,7 +2171,7 @@ else:
                             io.BytesIO(excel_bytes), sheet,
                             transit_distance=td, transit_speed=spd,
                             simulations=int(Simulations),
-                            eligible_indices=seasonal_eligible, htd=htd)
+                            start_times=sim_start_times, htd=htd)
                         foundation_results[label] = {
                             "vessel": vessel, "mode": mode,
                             "timeline": tl, "total": tot,
@@ -2265,7 +2285,6 @@ else:
         #  SECTION 5 – WTG weather simulations
         # ─────────────────────────────────────────────────────────────────
         st.subheader("5.  WTG Installation – Weather Simulations")
-        wtg_seasonal = get_seasonal_eligible_indices(wt_arr, Sim_start_date)
         wtg_weather_results = {}
         prog_wtg = st.progress(0, text="Running WTG weather simulations …")
 
@@ -2294,7 +2313,7 @@ else:
                             df_yard_wind, io.BytesIO(excel_bytes), sheet,
                             transit_distance=td, transit_speed=spd,
                             simulations=int(Simulations),
-                            eligible_indices=wtg_seasonal, seed=42, max_wait_hours=5000,
+                            start_times=sim_start_times, seed=42, max_wait_hours=5000,
                             htd=htd, mp_offset_days=offset,
                             loading_mode=mode)
                     else:
@@ -2303,7 +2322,7 @@ else:
                             df_yard_wind, io.BytesIO(excel_bytes), sheet,
                             transit_distance=td, transit_speed=spd,
                             simulations=int(Simulations),
-                            eligible_indices=wtg_seasonal, seed=42, max_wait_hours=5000,
+                            start_times=sim_start_times, seed=42, max_wait_hours=5000,
                             htd=htd, mp_offset_days=offset,
                             loading_mode=mode)
                     wtg_weather_results[label] = {

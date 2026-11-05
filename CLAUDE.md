@@ -72,7 +72,9 @@ Pipeline per case (vessel × loading mode × phase):
    (uniform Lo..Hi per row).
 5. **Weather** — `load_all_weather` merges project / barge / yard ZIPs; wind is
    `Adjusted_Windspeed = 0.9 × |u10,v10|`. `get_seasonal_eligible_indices` picks start hours around
-   the start date; `simulate_weather_impacts_foundation`, `simulate_weather_impacts_w90`,
+   the start date and `draw_start_times` draws them **once** per run; the same `start_times` go to
+   every case and to both phases (the WTG phase starts at `start_times[i]` + foundation duration),
+   while durations use a separate RNG stream (`default_rng([seed, 1])`). `simulate_weather_impacts_foundation`, `simulate_weather_impacts_w90`,
    `simulate_sequential_wtg_weather` step through the timeline and wait for workable weather
    via `_workable_runs` + `_window_start`: a restricted step starts only when its limits hold for
    every hour it touches, and steps start at the exact previous finish time (no rounding). `Loading_Weather` rows use the loading-location
