@@ -49,10 +49,6 @@ def _transits(tl):
     return int(tl["Description"].str.contains("Transit", case=False).sum())
 
 
-def _expected_row_hours(df):
-    return {int(r.N): (TH if r.transit else 0.5 * (r.lo + r.hi)) for r in df.itertuples()}
-
-
 # --------------------------------------------------------------------------- #
 #  Reference model sanity (should always pass)
 # --------------------------------------------------------------------------- #
@@ -102,10 +98,12 @@ NO_WEATHER_CASES = [
 
 def _app_no_weather_days(app, src, sheet, cap, kind):
     if kind in ("mp", "jk"):
-        exp = _expected_row_hours(R.read_sheet(src(), sheet))
+        # foundations have no separate no-weather simulator: take the expected
+        # hours of each timeline row (transit time or mid-range of Lo/Hi)
         tl = (app["build_mp_timeline"](src(), sheet, cap, N, HTD) if kind == "mp"
               else app["build_jacket_timeline"](src(), sheet, N, HTD))
-        return sum(exp[s] for s in tl["Sequence"]) / 24
+        mid = 0.5 * (tl["Lo_Hours"] + tl["Hi_Hours"])
+        return float(np.where(tl["Transit"], TH, mid).sum()) / 24
     if kind == "w90":
         tl = app["build_w90_timeline"](src(), sheet, cap, N, HTD, dock_distance=DOCK, transit_speed=SPEED)
         dur = app["add_duration_simulations_w90"](tl, src(), sheet, simulations=200, seed=42, htd=HTD,

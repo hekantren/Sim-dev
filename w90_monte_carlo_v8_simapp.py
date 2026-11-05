@@ -874,31 +874,143 @@ def _sheet_has_loading_phase(excel_src, sheet_name):
     return ("START" in flags.values) and ("END" in flags.values)
 
 
-# ── Monopile timeline builder (with Loading + Installation phases) ───────────
-def build_mp_timeline(excel_src, sheet_name, carry_cap, total_units, htd=1/24):
-    raw = _excel_read(excel_src, sheet_name)
-    raw.columns = [str(c).strip() for c in raw.columns]
-    desc_col = next(c for c in raw.columns if str(c).strip().startswith("Description"))
-    load_flags = raw["Loading"].map(_norm_marker)
-    inst_flags = raw["Installation"].map(_norm_marker)
-    load_end_idx = int(raw.index[load_flags.eq("END")][0])
-    load_phase   = raw.iloc[:load_end_idx + 1].reset_index(drop=True)
-    inst_phase   = raw.iloc[load_end_idx + 1:].reset_index(drop=True)
-    load_pf = load_phase["Loading"].map(_norm_marker)
-    inst_pf = inst_phase["Installation"].map(_norm_marker)
-    inst_dec = (int(inst_phase.index[inst_pf.eq("START")][0])
-                if len(inst_phase.index[inst_pf.eq("START")]) > 0 else 0)
+# ── Campaign plan (five-block cycle structure) ───────────────────────────────
+# Every operations sheet is split into five blocks around its Loading /
+# Installation markers:
+#   pre   rows before Loading START          -> once per cycle
+#   load  Loading START .. Loading END       -> once per unit carried
+#   mid   rows between Loading END and
+#         Installation START (e.g. transit)  -> once per cycle
+#   inst  Installation START .. END          -> once per unit installed
+#   post  rows after Installation END        -> once per cycle
+# Parallell-1/Parallell-2 loading pairs take the LONGER duration and the
+# STRICTER limits of the two rows.  The timeline built from the plan carries
+# each step's duration range, limits and weather location, so the duration
+# and weather simulators no longer look rows up in the sheet by Sequence.
 
-    def plists(pdf, mser, pname):
-        return {"seq" : pd.to_numeric(pdf["N"], errors="coerce").fillna(0).astype(int).tolist(),
-                "desc": pdf[desc_col].astype(str).tolist(),
-                "dur" : pd.to_numeric(pdf["Seq Dur (hrs)"], errors="coerce").fillna(0).astype(float).tolist(),
-                "mark": mser.tolist(),
-                "phase": [pname] * len(pdf),
-                "wxr": [pname == "installation"] * len(pdf)}
+# Template rows that are done at every turbine location although the sheet puts
+# them before Installation START.  Remove once the template is corrected.
+_PLAN_OVERRIDES = {"JUV": dict(per_unit_extra=(16, 17, 18))}
 
-    ld  = plists(load_phase, load_pf, "loading")
-    id_ = plists(inst_phase, inst_pf, "installation")
+
+def _read_ops_sheet(excel_src, sheet_name):
+    """Normalised operations table for one sheet (one row per sheet row)."""
+    raw = _excel_read(excel_src, sheet_name); raw.columns = [str(c).strip() for c in raw.columns]
+    desc_col = next(c for c in raw.columns if c.startswith("Description"))
+    p_cols = [c for c in raw.columns if c.startswith("Parallell")]
+    df = pd.DataFrame({
+        "N": pd.to_numeric(raw["N"], errors="coerce"),
+        "desc": raw[desc_col].astype(str).str.strip().replace({"nan": "", "None": ""}),
+        "seq": pd.to_numeric(raw["Seq Dur (hrs)"], errors="coerce"),
+        "tr": pd.to_numeric(raw["Tr (hrs)"], errors="coerce"),
+        "transit": raw["Transit"].map(_norm_bool),
+        "L": raw["Loading"].map(_norm_marker) if "Loading" in raw.columns else "",
+        "I": raw["Installation"].map(_norm_marker),
+        "wave": pd.to_numeric(raw["Oplim Waves (m)"], errors="coerce").fillna(np.inf),
+        "wind": pd.to_numeric(raw["Oplim Wind (m/s)"], errors="coerce").fillna(np.inf),
+        "p1": raw[p_cols[0]].map(_norm_bool) if len(p_cols) > 0 else False,
+        "p2": raw[p_cols[1]].map(_norm_bool) if len(p_cols) > 1 else False,
+    })
+    df = df.dropna(subset=["N"]).reset_index(drop=True)
+    df["N"] = df["N"].astype(int)
+    df["seq"] = df["seq"].fillna(df["tr"])
+    df["tr"] = df["tr"].fillna(df["seq"])
+    df["lo"] = df[["seq", "tr"]].min(axis=1)
+    df["hi"] = df[["seq", "tr"]].max(axis=1)
+    return df
+
+
+def _sheet_blocks(df):
+    """Split an operations table into (pre, load, mid, inst, post)."""
+    idx = lambda col, m: list(df.index[df[col].eq(m)])
+    ls, le = idx("L", "START"), idx("L", "END")
+    is_, ie = idx("I", "START"), idx("I", "END")
+    if not is_ and ie:                      # JUV/FIV MP sheets: END where START belongs
+        is_, ie = [ie[0]], [ie[-1]]
+    if not is_:
+        raise ValueError("Sheet has no Installation START/END markers.")
+    if not ls:                              # jacket sheets: no loading block
+        i0, i1 = is_[0], ie[-1]
+        return df.iloc[:i0], df.iloc[0:0], df.iloc[0:0], df.iloc[i0:i1 + 1], df.iloc[i1 + 1:]
+    l0, l1, i0, i1 = ls[0], le[0], is_[0], ie[-1]
+    return df.iloc[:l0], df.iloc[l0:l1 + 1], df.iloc[l1 + 1:i0], df.iloc[i0:i1 + 1], df.iloc[i1 + 1:]
+
+
+def _plan_step(r, block, unit=0, loading=False):
+    return {"seqs": [int(r.N)], "desc": r.desc, "lo": float(r.lo), "hi": float(r.hi),
+            "wave": float(r.wave), "wind": float(r.wind), "transit": bool(r.transit),
+            "loading": bool(loading), "block": block, "unit": int(unit), "branch_hrs": (0.0, 0.0)}
+
+
+def _build_plan(df, carry_cap, n_units, per_unit_extra=(), barge_fed=False, infield_rows=()):
+    """Step list for a whole campaign (see the block table above).
+
+    barge_fed:     jacket-style sheets where the vessel stays in the field; the
+                   rows before the install block run once (mobilisation).
+    infield_rows:  sheet N's flagged Transit that are in-field moves; they keep
+                   their own sheet hours instead of the transit time.
+    """
+    df = df.copy()
+    if len(infield_rows):
+        df.loc[df["N"].isin(infield_rows), "transit"] = False
+    pre, load, mid, inst, post = _sheet_blocks(df)
+    extra = df[df["N"].isin(per_unit_extra)]
+    mid = mid[~mid["N"].isin(per_unit_extra)]
+    # mid rows before the first transit row happen in port -> loading weather
+    mid_tr = np.flatnonzero(mid["transit"].to_numpy())
+    mid_port = set(mid.index[: mid_tr[0]]) if mid_tr.size else set()
+
+    if barge_fed:
+        # vessel stays in the field: mobilise once, then install unit by unit;
+        # rows after the install block (reposition) are per-unit in-field moves
+        plan = [_plan_step(r, "pre") for r in pre.itertuples()]
+        for u in range(int(n_units)):
+            plan += [_plan_step(r, "inst", u) for r in extra.itertuples()]
+            plan += [_plan_step(r, "inst", u) for r in inst.itertuples()]
+            plan += [_plan_step(r, "post", u) for r in post.itertuples()]
+        return plan
+
+    # per-unit loading steps (one step per Parallell-1/2 pair)
+    if len(load) and load["p1"].any() and load["p2"].any():
+        a, b = load[load["p1"]], load[load["p2"]]
+        once_rows = load[~(load["p1"] | load["p2"])]
+        unit_load = []
+        for k in range(max(len(a), len(b))):
+            rows = [r for r in (a.iloc[k] if k < len(a) else None,
+                                b.iloc[k] if k < len(b) else None) if r is not None]
+            unit_load.append({
+                "seqs": [int(r.N) for r in rows],
+                "desc": "  ||  ".join(r.desc for r in rows if r.desc) or "Parallel loading",
+                "lo": float(max(r.lo for r in rows)), "hi": float(max(r.hi for r in rows)),
+                "wave": float(min(r.wave for r in rows)), "wind": float(min(r.wind for r in rows)),
+                "transit": False, "loading": True, "block": "load", "unit": 0,
+                "branch_hrs": (float(np.nan_to_num(rows[0].seq)),
+                               float(np.nan_to_num(rows[1].seq)) if len(rows) > 1 else 0.0)})
+    else:
+        once_rows = load.iloc[0:0]
+        unit_load = [_plan_step(r, "load", loading=True) for r in load.itertuples()]
+
+    plan = []
+    left = int(n_units)
+    while left > 0:
+        k = min(int(carry_cap), left)
+        plan += [_plan_step(r, "pre", loading=not r.transit) for r in pre.itertuples()]
+        for u in range(k):
+            plan += [{**s, "unit": u} for s in unit_load]
+        plan += [_plan_step(r, "load-once", loading=True) for r in once_rows.itertuples()]
+        plan += [_plan_step(r, "mid", loading=(i in mid_port)) for i, r in zip(mid.index, mid.itertuples())]
+        for u in range(k):
+            plan += [_plan_step(r, "inst", u) for r in extra.itertuples()]
+            plan += [_plan_step(r, "inst", u) for r in inst.itertuples()]
+        plan += [_plan_step(r, "post") for r in post.itertuples()]
+        left -= k
+    return plan
+
+
+def _plan_to_timeline(plan, carry_cap, total_units, htd=1/24):
+    """One timeline row per plan step.  Lo_Hours / Hi_Hours are the sheet range;
+    transit rows take their time from the transit distance at simulation time."""
+    has_load = any(s["block"] == "load" for s in plan)
     inventory = 0; units_left = int(total_units); rows = []
 
     def cl():
@@ -906,80 +1018,79 @@ def build_mp_timeline(excel_src, sheet_name, carry_cap, total_units, htd=1/24):
             return math.ceil(units_left / carry_cap) + 1
         return math.ceil(units_left / carry_cap) if units_left > 0 else 0
 
-    def add(sq, ds, dr, ph, wr):
-        rows.append({"Sequence": int(sq), "Description": ds, "Phase": ph,
-                     "Weather_Restricted": bool(wr),
-                     "Seq_Duration_Days": float(dr) * htd,
+    for i, s in enumerate(plan):
+        nxt = plan[i + 1] if i + 1 < len(plan) else None
+        unit_ends = nxt is None or nxt["block"] != s["block"] or nxt["unit"] != s["unit"]
+        if s["block"] == "inst" and not has_load and inventory == 0:
+            inventory = 1; units_left -= 1          # barge-fed: pick up from barge
+        if s["block"] == "load" and unit_ends:
+            inventory += 1; units_left -= 1
+        par = len(s["seqs"]) > 1
+        rows.append({"Sequence": s["seqs"][0], "Description": s["desc"],
+                     "Phase": "loading" if s["loading"] else "installation",
+                     "Block": s["block"],
+                     "Weather_Restricted": True,
+                     "Transit": s["transit"],
+                     "Lo_Hours": s["lo"], "Hi_Hours": s["hi"],
+                     "Wave_Limit": s["wave"], "Wind_Limit": s["wind"],
+                     "Loading_Weather": s["loading"],
+                     "Seq_Duration_Days": float(np.nan_to_num(0.5 * (s["lo"] + s["hi"]))) * htd,
                      "Inventory": int(inventory),
-                     "WTG_Left": int(units_left), "Cycles_Left": int(cl())})
-
-    while units_left > 0 or inventory > 0:
-        while inventory < carry_cap and units_left > 0:
-            i = 0
-            while i < len(ld["seq"]):
-                add(ld["seq"][i], ld["desc"][i], ld["dur"][i], ld["phase"][i], ld["wxr"][i])
-                if ld["mark"][i] == "START": inventory += 1; units_left -= 1
-                if ld["mark"][i] == "END":   break
-                i += 1
-        while inventory > 0:
-            for i in range(len(id_["seq"])):
-                add(id_["seq"][i], id_["desc"][i], id_["dur"][i], id_["phase"][i], id_["wxr"][i])
-                if i == inst_dec: inventory -= 1
+                     "WTG_Left": int(units_left), "Cycles_Left": int(cl()),
+                     "Parallel_Block": par,
+                     "Parallel_Branch_1_Hours": s["branch_hrs"][0] * htd,
+                     "Parallel_Branch_2_Hours": s["branch_hrs"][1] * htd,
+                     "Source_Sequences": ", ".join(str(q) for q in s["seqs"])})
+        if s["block"] == "inst" and unit_ends:
+            inventory -= 1
     out = pd.DataFrame(rows); out.insert(0, "N", range(1, len(out) + 1))
+    return out
+
+
+def _timeline_step_arrays(timeline_df, transit_hours):
+    """Per-row (lo, hi, wave_lim, wind_lim, is_transit, loading_weather) arrays."""
+    tr = timeline_df["Transit"].to_numpy(dtype=bool)
+    lo = np.where(tr, transit_hours, np.nan_to_num(timeline_df["Lo_Hours"].to_numpy(dtype=float)))
+    hi = np.where(tr, transit_hours, np.nan_to_num(timeline_df["Hi_Hours"].to_numpy(dtype=float)))
+    return (lo, hi,
+            timeline_df["Wave_Limit"].to_numpy(dtype=float),
+            timeline_df["Wind_Limit"].to_numpy(dtype=float),
+            tr, timeline_df["Loading_Weather"].to_numpy(dtype=bool))
+
+
+def _add_duration_simulations(timeline_df, simulations, transit_hours, seed=42, htd=1/24):
+    """No-weather durations: uniform(Lo, Hi) per row, transit rows fixed."""
+    df = timeline_df.drop(columns=[c for c in timeline_df.columns if str(c).startswith("Sim")])
+    lo, hi, _, _, tr, _ = _timeline_step_arrays(df, transit_hours)
+    rng = np.random.default_rng(seed)
+    mat = rng.uniform(lo[:, None], hi[:, None], size=(len(df), simulations)) * htd
+    return pd.concat([df, pd.DataFrame(mat.astype(np.float32),
+                                       columns=[f"Sim{i}" for i in range(1, simulations + 1)],
+                                       index=df.index)], axis=1)
+
+
+# ── Monopile timeline builder (with Loading + Installation phases) ───────────
+def build_mp_timeline(excel_src, sheet_name, carry_cap, total_units, htd=1/24):
+    plan = _build_plan(_read_ops_sheet(excel_src, sheet_name), carry_cap, total_units)
+    out = _plan_to_timeline(plan, carry_cap, total_units, htd)
+    # Loading in port is not weather-checked in the foundation phase (yet).
+    out["Weather_Restricted"] = ~out["Loading_Weather"]
     return out
 
 
 # ── Jacket timeline builder (no loading phase — barge-fed at project site) ───
 def build_jacket_timeline(excel_src, sheet_name, total_units, htd=1/24):
     """Jackets are delivered on barges to the project site, so there is no
-    loading-yard cycle.  The sheet's Installation column carries START/END
-    markers around the per-jacket install cycle.  Rows OUTSIDE the START..END
-    block (typically a leading transit row, and a trailing reposition row)
-    are executed once per jacket and treated as installation-phase, weather-
-    restricted operations.
+    loading-yard cycle: the vessel mobilises once (rows before Installation
+    START), then installs jacket by jacket.  Transit-flagged rows after
+    Installation END are in-field repositioning and keep their sheet hours.
+    All steps are weather-restricted at the project site.
     """
-    raw = _excel_read(excel_src, sheet_name)
-    raw.columns = [str(c).strip() for c in raw.columns]
-    desc_col = next(c for c in raw.columns if str(c).strip().startswith("Description"))
-
-    inst_flags = raw["Installation"].map(_norm_marker)
-    starts = raw.index[inst_flags.eq("START")]
-    ends   = raw.index[inst_flags.eq("END")]
-    if len(starts) == 0 or len(ends) == 0:
-        raise ValueError(f"Jacket sheet '{sheet_name}' must have Installation START and END markers.")
-    start_idx = int(starts[0])
-    end_idx   = int(ends[0])
-
-    # The whole sheet is the per-jacket cycle (transit-in → install → reposition).
-    # We repeat it total_units times.
-    cycle = raw.reset_index(drop=True)
-
-    seqs  = pd.to_numeric(cycle["N"], errors="coerce").fillna(0).astype(int).tolist()
-    descs = cycle[desc_col].astype(str).tolist()
-    durs  = pd.to_numeric(cycle["Seq Dur (hrs)"], errors="coerce").fillna(0).astype(float).tolist()
-
-    inventory = 0; units_left = int(total_units); rows = []
-
-    def cl():
-        return units_left if units_left > 0 else 0
-
-    def add(sq, ds, dr):
-        rows.append({"Sequence": int(sq), "Description": ds, "Phase": "installation",
-                     "Weather_Restricted": True,
-                     "Seq_Duration_Days": float(dr) * htd,
-                     "Inventory": int(inventory),
-                     "WTG_Left": int(units_left), "Cycles_Left": int(cl())})
-
-    for _ in range(int(total_units)):
-        inventory = 1
-        for i in range(len(cycle)):
-            add(seqs[i], descs[i], durs[i])
-            if i == start_idx: inventory = 1   # picked up jacket from barge
-            if i == end_idx:   inventory = 0   # jacket installed
-        units_left -= 1
-
-    out = pd.DataFrame(rows); out.insert(0, "N", range(1, len(out) + 1))
-    return out
+    df = _read_ops_sheet(excel_src, sheet_name)
+    post = _sheet_blocks(df)[4]
+    plan = _build_plan(df, 1, total_units, barge_fed=True,
+                       infield_rows=tuple(post.loc[post["transit"], "N"]))
+    return _plan_to_timeline(plan, 1, total_units, htd)
 
 
 # ── Foundation weather impacts (works for both MP and Jacket sheets) ─────────
@@ -989,28 +1100,10 @@ def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, shee
                                          max_wait_hours=5000, htd=1/24):
     """Project-site weather sim for foundation installation (MP or Jacket).
     Same logic as the original simulate_weather_impacts_mp — both sheet styles
-    share the same column shape (N / Seq Dur / Tr / Transit / Oplim Wave / Oplim Wind)."""
+    share the same column shape (N / Seq Dur / Tr / Transit / Oplim Wave / Oplim Wind).
+    Durations and limits come from the timeline rows; excel_src / sheet_name are
+    kept for call compatibility."""
     transit_hours = float(transit_distance) / float(transit_speed)
-    raw = _excel_read(excel_src, sheet_name)
-    raw.columns = [str(c).strip() for c in raw.columns]
-    op = raw[["N", "Seq Dur (hrs)", "Tr (hrs)", "Transit",
-              "Oplim Waves (m)", "Oplim Wind (m/s)"]].copy()
-    for c in ["N", "Seq Dur (hrs)", "Tr (hrs)"]:
-        op[c] = pd.to_numeric(op[c], errors="coerce")
-    op["Transit"]          = op["Transit"].map(_norm_bool)
-    op["Oplim Waves (m)"]  = pd.to_numeric(op["Oplim Waves (m)"], errors="coerce").fillna(np.inf)
-    op["Oplim Wind (m/s)"] = pd.to_numeric(op["Oplim Wind (m/s)"], errors="coerce").fillna(np.inf)
-    nt = ~op["Transit"]
-    op.loc[nt, "Seq Dur (hrs)"] = op.loc[nt, "Seq Dur (hrs)"].fillna(op.loc[nt, "Tr (hrs)"])
-    op.loc[nt, "Tr (hrs)"]      = op.loc[nt, "Tr (hrs)"].fillna(op.loc[nt, "Seq Dur (hrs)"])
-    op.loc[op["Transit"], ["Seq Dur (hrs)", "Tr (hrs)"]] = transit_hours
-    op = op.dropna(subset=["N", "Seq Dur (hrs)", "Tr (hrs)"]).drop_duplicates(subset=["N"])
-    op["N"] = op["N"].astype(int)
-    lm  = dict(zip(op["N"], np.minimum(op["Seq Dur (hrs)"], op["Tr (hrs)"])))
-    hm  = dict(zip(op["N"], np.maximum(op["Seq Dur (hrs)"], op["Tr (hrs)"])))
-    wvm = dict(zip(op["N"], op["Oplim Waves (m)"]))
-    wdm = dict(zip(op["N"], op["Oplim Wind (m/s)"]))
-    tm  = dict(zip(op["N"], op["Transit"]))
     base = timeline_df[["N", "Sequence", "Inventory", "WTG_Left", "Cycles_Left",
                         "Weather_Restricted", "Phase"]].copy()
     base["Sequence"] = base["Sequence"].astype(int)
@@ -1029,12 +1122,7 @@ def simulate_weather_impacts_foundation(timeline_df, weather_df, excel_src, shee
     rng = np.random.default_rng(seed); n = len(base)
     tot_m = np.zeros((n, simulations), dtype=np.float32)
     dwn_m = np.zeros((n, simulations), dtype=np.float32)
-    seqs = base["Sequence"].to_numpy(dtype=int)
-    sl  = np.array([lm[s]  for s in seqs], dtype=float)
-    sh  = np.array([hm[s]  for s in seqs], dtype=float)
-    swl = np.array([wvm[s] for s in seqs], dtype=float)
-    swd = np.array([wdm[s] for s in seqs], dtype=float)
-    sit = np.array([tm[s]  for s in seqs], dtype=bool)
+    sl, sh, swl, swd, sit, _ = _timeline_step_arrays(timeline_df, transit_hours)
     swx = base["Weather_Restricted"].to_numpy(dtype=bool)
 
     def wait(start, wlim, wndlim):
@@ -1082,287 +1170,50 @@ def get_seasonal_eligible_indices(weather_times, start_date_str,
     return eligible
 
 
-# ── W90 WTG timeline (new per-turbine parallel-loading model) ────────────────
+def _wtg_plan_overrides(sheet_name, vessel):
+    key = vessel if vessel is not None else str(sheet_name).strip().split(" ")[0]
+    return _PLAN_OVERRIDES.get(key, {})
+
+
+# ── W90 WTG timeline (per-turbine parallel loading) ──────────────────────────
 def build_w90_timeline(excel_src, sheet_name, carry_cap, total_wtg, htd=1/24,
-                       dock_distance=None, transit_speed=None):
-    """Build the W90 WTG installation timeline under the v8 loading model.
+                       dock_distance=None, transit_speed=None, vessel=None):
+    """W90 WTG campaign timeline (five-block cycle).
 
-    Loading model (per latest W90 WTG sheet):
-      • There may be pre-loading rows before the Loading START marker — these
-        run ONCE per loading cycle (not per turbine).
-      • The parallel-loading block is the set of rows (between Loading START and
-        Loading END) flagged Parallell 1 and/or Parallell 2.  Loading is now done
-        one turbine at a time: the parallel block is repeated once per turbine
-        loaded (i.e. min(carry_cap, wtg_left) times) before the vessel transits.
-      • Parallell 1 and Parallell 2 are treated as taking the same time, so the
-        per-turbine loading duration uses the Parallell-1 hourly durations.  Each
-        Parallell-1 row is paired 1:1 (by order) with a Parallell-2 row; the two
-        descriptions are combined and the Parallell-1 duration is used.
-      • Any non-parallel rows inside the loading block (rare) run once per cycle.
-
-    Installation is unchanged: the per-turbine install cycle (Installation
-    START..END) repeats once for each turbine in inventory; transit rows use
-    dock_distance / transit_speed.
+    Rows before Loading START run once per cycle; each Parallell-1/Parallell-2
+    pair in the loading block is one step per turbine loaded, taking the longer
+    duration and stricter limits of the pair; the transit out, the per-turbine
+    install block and the transit back follow once per cycle.  dock_distance /
+    transit_speed are kept for call compatibility: transit time is applied by
+    the duration and weather simulators.
     """
-    raw = _excel_read(excel_src, sheet_name); raw.columns = [str(c).strip() for c in raw.columns]
-    lf  = raw["Loading"].map(_norm_marker); if_ = raw["Installation"].map(_norm_marker)
-    lsi = int(lf[lf.eq("START")].index[0])
-    lei = int(lf[lf.eq("END")].index[0])
-    isi = int(if_[if_.eq("START")].index[0])
-    iei = int(if_[if_.eq("END")].index[0])
-
-    # Loading-cycle preamble = rows BEFORE Loading START (run once per cycle).
-    pre = raw.iloc[:lsi].reset_index(drop=True)
-    # Loading block = Loading START .. END (the parallel-loading section).
-    lp  = raw.iloc[lsi:lei + 1].reset_index(drop=True)
-    # Install block = Installation START .. END.
-    ip  = raw.iloc[isi:iei + 1].reset_index(drop=True)
-    ipf = ip["Installation"].map(_norm_marker)
-    isp = int(ipf[ipf.eq("START")].index[0])
-
-    def _row_dur(pdf, i):
-        ts = _norm_bool(pdf.iloc[i]["Transit"])
-        if ts:
-            return dock_distance / transit_speed
-        return float(pd.to_numeric(pdf.iloc[i]["Seq Dur (hrs)"], errors="coerce") or 0.0)
-
-    def plists(pdf, mser):
-        return {"seq" : pd.to_numeric(pdf["N"], errors="coerce").fillna(0).astype(int).tolist(),
-                "desc": pdf["Description"].astype(str).tolist(),
-                "dur" : [_row_dur(pdf, i) for i in range(len(pdf))],
-                "mark": mser.tolist(),
-                "p1"  : pdf["Parallell  1"].map(_norm_bool).tolist(),
-                "p2"  : pdf["Parallell  2"].map(_norm_bool).tolist()}
-
-    pre_l = plists(pre, pre["Loading"].map(_norm_marker)) if len(pre) else None
-    ld    = plists(lp, lp["Loading"].map(_norm_marker))
-    id_   = plists(ip, ipf)
-
-    # Build the loading-step template (one collapsed row per parallel pair).
-    # Parallell-1 rows are paired by order with Parallell-2 rows; non-parallel
-    # rows inside the loading block become standalone once-per-cycle rows.
-    p1_idx = [i for i in range(len(ld["seq"])) if ld["p1"][i]]
-    p2_idx = [i for i in range(len(ld["seq"])) if ld["p2"][i]]
-
-    def _clean_desc(d):
-        d = str(d).strip()
-        return "" if d.lower() in {"nan", "none"} else d
-
-    # Per-turbine loading steps (paired P1/P2; duration from P1).
-    per_turbine_steps = []
-    n_pairs = max(len(p1_idx), len(p2_idx))
-    for k in range(n_pairs):
-        i1 = p1_idx[k] if k < len(p1_idx) else None
-        i2 = p2_idx[k] if k < len(p2_idx) else None
-        dur = ld["dur"][i1] if i1 is not None else ld["dur"][i2]      # P1 duration
-        d1  = _clean_desc(ld["desc"][i1]) if i1 is not None else ""
-        d2  = _clean_desc(ld["desc"][i2]) if i2 is not None else ""
-        if d1 and d2:
-            desc = f"{d1}  ||  {d2}"
-        else:
-            desc = d1 or d2 or "Parallel loading"
-        seq = ld["seq"][i1] if i1 is not None else ld["seq"][i2]
-        per_turbine_steps.append({
-            "seq": int(seq), "desc": desc, "dur": float(dur),
-            "p1_seq": int(ld["seq"][i1]) if i1 is not None else None,
-            "p2_seq": int(ld["seq"][i2]) if i2 is not None else None,
-            "p1_dur": float(ld["dur"][i1]) if i1 is not None else 0.0,
-            "p2_dur": float(ld["dur"][i2]) if i2 is not None else 0.0,
-        })
-
-    # Non-parallel rows inside the loading block (once per cycle).
-    once_loading_steps = [
-        {"seq": int(ld["seq"][i]), "desc": _clean_desc(ld["desc"][i]) or "Loading step",
-         "dur": float(ld["dur"][i])}
-        for i in range(len(ld["seq"])) if not (ld["p1"][i] or ld["p2"][i])
-    ]
-
-    inventory = 0; wtg_left = int(total_wtg); rows = []
-
-    def cl():
-        if inventory > 0: return math.ceil(wtg_left / carry_cap) + 1
-        return math.ceil(wtg_left / carry_cap) if wtg_left > 0 else 0
-
-    def add(sq, ds, dr, is_par, p1_seq=None, p2_seq=None, p1_dur=0.0, p2_dur=0.0):
-        rows.append({"Sequence": int(sq), "Description": ds,
-                     "Seq_Duration_Hours": float(dr) * htd,
-                     "Inventory": int(inventory),
-                     "WTG_Left": int(wtg_left), "Cycles_Left": int(cl()),
-                     "Parallel_Block": bool(is_par),
-                     "Parallel_Branch_1_Hours": float(p1_dur) * htd,
-                     "Parallel_Branch_2_Hours": float(p2_dur) * htd,
-                     "Source_Sequences": (", ".join(str(s) for s in [p1_seq, p2_seq] if s is not None)
-                                          if is_par else str(int(sq)))})
-
-    while wtg_left > 0 or inventory > 0:
-        if inventory == 0 and wtg_left > 0:
-            # 1) Pre-loading preamble — once per cycle.
-            if pre_l is not None:
-                for i in range(len(pre_l["seq"])):
-                    add(pre_l["seq"][i], _clean_desc(pre_l["desc"][i]) or "Pre-loading",
-                        pre_l["dur"][i], False)
-            # 2) Load one turbine at a time (parallel block repeats per turbine).
-            to_load = min(carry_cap, wtg_left)
-            for _t in range(to_load):
-                for step in per_turbine_steps:
-                    add(step["seq"], step["desc"], step["dur"], True,
-                        p1_seq=step["p1_seq"], p2_seq=step["p2_seq"],
-                        p1_dur=step["p1_dur"], p2_dur=step["p2_dur"])
-                inventory += 1; wtg_left -= 1
-            # 3) Any once-per-cycle non-parallel loading rows.
-            for step in once_loading_steps:
-                add(step["seq"], step["desc"], step["dur"], False)
-        # 4) Install loop — per turbine in inventory.
-        while inventory > 0:
-            i = 0
-            while i < len(id_["seq"]):
-                add(id_["seq"][i], _clean_desc(id_["desc"][i]) or "Install step",
-                    id_["dur"][i], False)
-                if id_["mark"][i] == "START": inventory -= 1
-                if id_["mark"][i] == "END":
-                    if inventory > 0: i = isp; continue
-                    else: break
-                i += 1
-
-    out = pd.DataFrame(rows); out.insert(0, "N", range(1, len(out) + 1))
-    return out
+    plan = _build_plan(_read_ops_sheet(excel_src, sheet_name), carry_cap, total_wtg,
+                       **_wtg_plan_overrides(sheet_name, vessel))
+    return _plan_to_timeline(plan, carry_cap, total_wtg, htd)
 
 
 def add_duration_simulations_w90(timeline_df, excel_src, sheet_name, simulations=1, seed=42,
                                   htd=1/24, transit_distance=None, transit_speed=None):
-    """No-weather duration simulator for W90 WTG (v8 paired-loading model).
-
-    Each timeline row is a single operation.  For a parallel-loading pair the
-    timeline row's Sequence is the Parallell-1 sequence and its duration is drawn
-    from that Parallell-1 row's Seq Dur range (P1 and P2 are treated as equal
-    time, so the P1 duration represents the parallel step).  Transit rows use
+    """No-weather duration simulator for W90 WTG.  Each timeline row draws its
+    duration from the row's Lo/Hi range; transit rows use
     transit_distance / transit_speed."""
-    raw = _excel_read(excel_src, sheet_name); raw.columns = [str(c).strip() for c in raw.columns]
-    dur = raw[["N", "Seq Dur (hrs)", "Tr (hrs)", "Transit"]].copy()
-    dur["N"]             = pd.to_numeric(dur["N"], errors="coerce")
-    dur["Seq Dur (hrs)"] = pd.to_numeric(dur["Seq Dur (hrs)"], errors="coerce")
-    dur["Tr (hrs)"]      = pd.to_numeric(dur["Tr (hrs)"], errors="coerce")
-    dur["Transit"]       = dur["Transit"].map(_norm_bool)
-    dur = dur.dropna(subset=["N"]).drop_duplicates(subset=["N"])
-    dur["N"] = dur["N"].astype(int)
-    tm  = dict(zip(dur["N"], dur["Transit"]))
-    bl  = dict(zip(dur["N"], dur[["Seq Dur (hrs)", "Tr (hrs)"]].min(axis=1)))
-    bh  = dict(zip(dur["N"], dur[["Seq Dur (hrs)", "Tr (hrs)"]].max(axis=1)))
-    df = timeline_df.copy()
-    df = df.drop(columns=[c for c in df.columns if str(c).startswith("Sim")])
-
-    def _row_seq(row):
-        # For a parallel pair, the first source sequence is the Parallell-1 row,
-        # whose duration governs the (equal-time) parallel step.
-        if bool(row["Parallel_Block"]):
-            parts = [s.strip() for s in str(row["Source_Sequences"]).split(",") if s.strip()]
-            return int(parts[0]) if parts else int(row["Sequence"])
-        return int(row["Sequence"])
-
-    seqs = [_row_seq(row) for _, row in df.iterrows()]
-    lm  = {s: (transit_distance / transit_speed if tm.get(s) else float(bl.get(s, 0.0))) for s in set(seqs)}
-    hm_ = {s: (transit_distance / transit_speed if tm.get(s) else float(bh.get(s, 0.0))) for s in set(seqs)}
-    rng = np.random.default_rng(seed)
-    mat = np.empty((len(df), simulations), dtype=np.float32)
-    for ri, s in enumerate(seqs):
-        lo, hi = lm[s], hm_[s]
-        if hi <= lo:
-            mat[ri, :] = lo * htd
-        else:
-            mat[ri, :] = rng.uniform(lo, hi, size=simulations) * htd
-    return pd.concat([df.copy(),
-                      pd.DataFrame(mat, columns=[f"Sim{i}" for i in range(1, simulations + 1)],
-                                   index=df.index)], axis=1)
+    return _add_duration_simulations(timeline_df, simulations,
+                                     float(transit_distance) / float(transit_speed), seed, htd)
 
 
 def build_sequential_wtg_timeline(excel_src, sheet_name, carry_cap, total_wtg, htd=1/24,
-                                   dock_distance=None, transit_speed=None):
-    raw = _excel_read(excel_src, sheet_name); raw.columns = [str(c).strip() for c in raw.columns]
-    lf  = raw["Loading"].map(_norm_marker); if_ = raw["Installation"].map(_norm_marker)
-    isi = int(if_[if_.eq("START")].index[0])
-    iec = if_[if_.eq("END")].index
-    iei = int(iec[0]) if len(iec) > 0 else int(raw.index[-1])
-    lp  = raw.iloc[:isi].reset_index(drop=True)
-    ip  = raw.iloc[isi:iei + 1].reset_index(drop=True)
-    lpf = lp["Loading"].map(_norm_marker); ipf = ip["Installation"].map(_norm_marker)
-
-    def plists(pdf, mser):
-        ts = pdf["Transit"].map(_norm_bool)
-        durs = [dock_distance / transit_speed if ts.iloc[i]
-                else float(pd.to_numeric(pdf.iloc[i]["Seq Dur (hrs)"], errors="coerce") or 0.0)
-                for i in range(len(pdf))]
-        return {"seq" : pd.to_numeric(pdf["N"], errors="coerce").fillna(0).astype(int).tolist(),
-                "desc": pdf["Description"].astype(str).tolist(),
-                "dur" : durs,
-                "mark": mser.tolist()}
-
-    ld = plists(lp, lpf); id_ = plists(ip, ipf)
-    inventory = 0; wtg_left = int(total_wtg); rows = []
-
-    def cl():
-        if inventory > 0: return math.ceil(wtg_left / carry_cap) + 1
-        return math.ceil(wtg_left / carry_cap) if wtg_left > 0 else 0
-
-    def add(sq, ds, dr):
-        rows.append({"Sequence": int(sq), "Description": ds,
-                     "Seq_Duration_Hours": float(dr) * htd,
-                     "Inventory": int(inventory),
-                     "WTG_Left": int(wtg_left), "Cycles_Left": int(cl())})
-
-    while wtg_left > 0 or inventory > 0:
-        while inventory < carry_cap and wtg_left > 0:
-            i = 0
-            while i < len(ld["seq"]):
-                add(ld["seq"][i], ld["desc"][i], ld["dur"][i])
-                if ld["mark"][i] == "START": inventory += 1; wtg_left -= 1
-                if ld["mark"][i] == "END": break
-                i += 1
-        while inventory > 0:
-            i = 0
-            while i < len(id_["seq"]):
-                add(id_["seq"][i], id_["desc"][i], id_["dur"][i])
-                if id_["mark"][i] == "START": inventory -= 1
-                if id_["mark"][i] == "END": break
-                i += 1
-    out = pd.DataFrame(rows); out.insert(0, "N", range(1, len(out) + 1))
-    return out
+                                   dock_distance=None, transit_speed=None, vessel=None):
+    """JUV / FIV WTG campaign timeline (five-block cycle): one port call and
+    transit per cycle, loading and installation per turbine."""
+    plan = _build_plan(_read_ops_sheet(excel_src, sheet_name), carry_cap, total_wtg,
+                       **_wtg_plan_overrides(sheet_name, vessel))
+    return _plan_to_timeline(plan, carry_cap, total_wtg, htd)
 
 
 def add_duration_simulations_sequential(timeline_df, excel_src, sheet_name, simulations=1,
                                          dock_distance=0, transit_speed=1, seed=42, htd=1/24):
-    raw = _excel_read(excel_src, sheet_name); raw.columns = [str(c).strip() for c in raw.columns]
-    dur = raw[["N", "Seq Dur (hrs)", "Tr (hrs)", "Transit"]].copy()
-    dur["N"]             = pd.to_numeric(dur["N"], errors="coerce")
-    dur["Seq Dur (hrs)"] = pd.to_numeric(dur["Seq Dur (hrs)"], errors="coerce")
-    dur["Tr (hrs)"]      = pd.to_numeric(dur["Tr (hrs)"], errors="coerce")
-    dur["Transit"]       = dur["Transit"].map(_norm_bool)
-    dur = dur.dropna(subset=["N"]).drop_duplicates(subset=["N"])
-    dur["N"] = dur["N"].astype(int)
-    td_days = (dock_distance / transit_speed) * htd
-    lm = {}; hm = {}; fm = {}
-    for _, row in dur.iterrows():
-        s = int(row["N"])
-        if row["Transit"]: fm[s] = float(td_days)
-        else:
-            lm[s] = float(min(row["Seq Dur (hrs)"], row["Tr (hrs)"])) * htd
-            hm[s] = float(max(row["Seq Dur (hrs)"], row["Tr (hrs)"])) * htd
-    df = timeline_df.copy()
-    df = df.drop(columns=[c for c in df.columns if str(c).startswith("Sim")])
-    df["_l"] = df["Sequence"].map(lm)
-    df["_h"] = df["Sequence"].map(hm)
-    df["_f"] = df["Sequence"].map(fm)
-    lows = df["_l"].to_numpy(dtype=float)
-    highs = df["_h"].to_numpy(dtype=float)
-    fixeds = df["_f"].to_numpy(dtype=float)
-    tmask = ~np.isnan(fixeds); ntmask = ~tmask
-    rng = np.random.default_rng(seed)
-    mat = np.empty((len(df), simulations), dtype=np.float32)
-    mat[tmask, :]  = fixeds[tmask, None]
-    mat[ntmask, :] = rng.uniform(lows[ntmask, None], highs[ntmask, None],
-                                  size=(ntmask.sum(), simulations))
-    return pd.concat([df.drop(columns=["_l", "_h", "_f"]),
-                      pd.DataFrame(mat, columns=[f"Sim{i}" for i in range(1, simulations + 1)],
-                                   index=df.index)], axis=1)
+    return _add_duration_simulations(timeline_df, simulations,
+                                     float(dock_distance) / float(transit_speed), seed, htd)
 
 
 def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_df,
@@ -1381,64 +1232,15 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
       • Installation rows → PROJECT weather (wind + waves)
       • Transit rows      → PROJECT weather (wind + waves)
 
-    The timeline_df is the v8 paired-loading timeline: each row is a single
-    operation, and a parallel-loading pair carries its Parallell-1 sequence first
-    in Source_Sequences (its duration / oplims govern the equal-time step).
+    Each timeline row carries its own duration range, limits and weather
+    location (Loading_Weather); a parallel-loading pair is one row with the
+    longer duration and stricter limits of the pair.
     """
     transit_hours = float(transit_distance) / float(transit_speed)
-    raw = _excel_read(excel_src, sheet_name); raw.columns = [str(c).strip() for c in raw.columns]
-    op = raw[["N", "Seq Dur (hrs)", "Tr (hrs)", "Transit", "Loading", "Installation",
-              "Oplim Waves (m)", "Oplim Wind (m/s)"]].copy()
-    op["N"] = pd.to_numeric(op["N"], errors="coerce")
-    for c in ["Seq Dur (hrs)", "Tr (hrs)"]:
-        op[c] = pd.to_numeric(op[c], errors="coerce")
-    op["Transit"]      = op["Transit"].map(_norm_bool)
-    op["Loading"]      = op["Loading"].map(_norm_marker)
-    op["Installation"] = op["Installation"].map(_norm_marker)
-    op["Oplim Waves (m)"]  = pd.to_numeric(op["Oplim Waves (m)"], errors="coerce").fillna(np.inf)
-    op["Oplim Wind (m/s)"] = pd.to_numeric(op["Oplim Wind (m/s)"], errors="coerce").fillna(np.inf)
-    nt = ~op["Transit"]
-    op.loc[nt, "Seq Dur (hrs)"] = op.loc[nt, "Seq Dur (hrs)"].fillna(op.loc[nt, "Tr (hrs)"])
-    op.loc[nt, "Tr (hrs)"]      = op.loc[nt, "Tr (hrs)"].fillna(op.loc[nt, "Seq Dur (hrs)"])
-    op.loc[op["Transit"], ["Seq Dur (hrs)", "Tr (hrs)"]] = transit_hours
-    op = op.dropna(subset=["N", "Seq Dur (hrs)", "Tr (hrs)"]).drop_duplicates(subset="N")
-    op["N"] = op["N"].astype(int)
-
-    # Determine the set of sequences that belong to the loading phase
-    # (Loading START .. Loading END inclusive).
-    ls = op.index[op["Loading"].eq("START")]
-    le = op.index[op["Loading"].eq("END")]
-    if len(ls) > 0 and len(le) > 0:
-        loading_seq_set = set(op.loc[int(ls[0]):int(le[0]), "N"].tolist())
-    else:
-        loading_seq_set = set()
-
-    lm  = dict(zip(op["N"], np.minimum(op["Seq Dur (hrs)"], op["Tr (hrs)"])))
-    hm  = dict(zip(op["N"], np.maximum(op["Seq Dur (hrs)"], op["Tr (hrs)"])))
-    wvm = dict(zip(op["N"], op["Oplim Waves (m)"]))
-    wdm = dict(zip(op["N"], op["Oplim Wind (m/s)"]))
-    tm  = dict(zip(op["N"], op["Transit"]))
-
     base = timeline_df[["N", "Sequence", "Inventory", "WTG_Left", "Cycles_Left",
                         "Parallel_Block", "Source_Sequences"]].copy()
     base["Sequence"] = pd.to_numeric(base["Sequence"], errors="coerce").astype(int)
-
-    # Classify each timeline row's weather phase.
-    #   loading  → uses the selected loading-location weather
-    #   project  → installation + transit rows → project weather
-    rspecs = []
-    for _, row in base.iterrows():
-        is_par = bool(row["Parallel_Block"])
-        seqs = ([int(s.strip()) for s in str(row["Source_Sequences"]).split(",") if s.strip()]
-                if is_par else [int(row["Sequence"])])
-        gov = seqs[0]  # governing sequence (Parallell-1 for pairs)
-        is_transit = bool(tm.get(gov, False))
-        is_loading = (gov in loading_seq_set) and not is_transit
-        phase_type = "loading" if is_loading else "project"
-        rspecs.append({"is_parallel": is_par, "gov": gov, "is_transit": is_transit,
-                       "wave_lim": float(wvm.get(gov, np.inf)),
-                       "wind_lim": float(wdm.get(gov, np.inf)),
-                       "phase_type": phase_type})
+    sl, sh, swl, swd, sit, s_is_loading = _timeline_step_arrays(timeline_df, transit_hours)
 
     wave_col = _find_col(project_weather_df, _WAVE_HEIGHT_COLS, "wave height")
 
@@ -1492,25 +1294,19 @@ def simulate_weather_impacts_w90(timeline_df, project_weather_df, barge_weather_
                 return h, i
         raise RuntimeError("Exceeded max_wait_hours.")
 
-    def _draw(spec):
-        s = spec["gov"]
-        return transit_hours if tm.get(s) else float(rng.uniform(lm[s], hm[s]))
-
     summ = []
     for si in range(simulations):
         sidx = int(rng.choice(eli)); bs = pd.Timestamp(pt[sidx])
         offset = float(mp_offset_days[si]) if mp_offset_days is not None else 0.0
         ct = bs + pd.Timedelta(days=offset); ss = ct; ta = td = 0.0
-        for ri, spec in enumerate(rspecs):
-            if spec["phase_type"] == "loading":
-                dh, pi = _wait(lt, lnd, lw_waves, ct,
-                               spec["wave_lim"], spec["wind_lim"], loading_check_waves)
+        for ri in range(n):
+            if s_is_loading[ri]:
+                dh, pi = _wait(lt, lnd, lw_waves, ct, swl[ri], swd[ri], loading_check_waves)
                 op_s = pd.Timestamp(lt[pi])
             else:  # installation + transit → project weather
-                dh, pi = _wait(pt, pnd, pw, ct,
-                               spec["wave_lim"], spec["wind_lim"], True)
+                dh, pi = _wait(pt, pnd, pw, ct, swl[ri], swd[ri], True)
                 op_s = pd.Timestamp(pt[pi])
-            ah = _draw(spec)
+            ah = transit_hours if sit[ri] else float(rng.uniform(sl[ri], sh[ri]))
             tot_m[ri, si] = (dh + ah) * htd
             dwn_m[ri, si] = dh * htd
             ta += ah; td += dh
@@ -1541,39 +1337,10 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
           – 'Offshore'  → PROJECT weather (wind + waves)
       • Installation rows → PROJECT weather (wind + waves)
       • Transit rows      → PROJECT weather (wind + waves)
+    Each timeline row carries its own duration range, limits and weather
+    location (Loading_Weather).
     """
     transit_hours = float(transit_distance) / float(transit_speed)
-    raw = _excel_read(excel_src, sheet_name); raw.columns = [str(c).strip() for c in raw.columns]
-    op = raw[["N", "Seq Dur (hrs)", "Tr (hrs)", "Transit", "Loading", "Installation",
-              "Oplim Waves (m)", "Oplim Wind (m/s)"]].copy()
-    op["N"] = pd.to_numeric(op["N"], errors="coerce")
-    for c in ["Seq Dur (hrs)", "Tr (hrs)"]:
-        op[c] = pd.to_numeric(op[c], errors="coerce")
-    op["Transit"]      = op["Transit"].map(_norm_bool)
-    op["Loading"]      = op["Loading"].map(_norm_marker)
-    op["Installation"] = op["Installation"].map(_norm_marker)
-    op["Oplim Waves (m)"]  = pd.to_numeric(op["Oplim Waves (m)"], errors="coerce").fillna(np.inf)
-    op["Oplim Wind (m/s)"] = pd.to_numeric(op["Oplim Wind (m/s)"], errors="coerce").fillna(np.inf)
-    nt = ~op["Transit"]
-    op.loc[nt, "Seq Dur (hrs)"] = op.loc[nt, "Seq Dur (hrs)"].fillna(op.loc[nt, "Tr (hrs)"])
-    op.loc[nt, "Tr (hrs)"]      = op.loc[nt, "Tr (hrs)"].fillna(op.loc[nt, "Seq Dur (hrs)"])
-    op.loc[op["Transit"], ["Seq Dur (hrs)", "Tr (hrs)"]] = transit_hours
-    op = op.dropna(subset=["N", "Seq Dur (hrs)", "Tr (hrs)"]).drop_duplicates(subset="N")
-    op["N"] = op["N"].astype(int)
-
-    # Sequences belonging to the loading phase (Loading START..END inclusive).
-    ls = op.index[op["Loading"].eq("START")]
-    le = op.index[op["Loading"].eq("END")]
-    if len(ls) > 0 and len(le) > 0:
-        loading_seq_set = set(op.loc[int(ls[0]):int(le[0]), "N"].tolist())
-    else:
-        loading_seq_set = set()
-
-    lm  = dict(zip(op["N"], np.minimum(op["Seq Dur (hrs)"], op["Tr (hrs)"])))
-    hm  = dict(zip(op["N"], np.maximum(op["Seq Dur (hrs)"], op["Tr (hrs)"])))
-    wvm = dict(zip(op["N"], op["Oplim Waves (m)"]))
-    wdm = dict(zip(op["N"], op["Oplim Wind (m/s)"]))
-    tm  = dict(zip(op["N"], op["Transit"]))
     base = timeline_df[["N", "Sequence", "Inventory", "WTG_Left", "Cycles_Left"]].copy()
     base["Sequence"] = pd.to_numeric(base["Sequence"], errors="coerce").astype(int)
 
@@ -1615,16 +1382,9 @@ def simulate_sequential_wtg_weather(timeline_df, project_weather_df, barge_weath
     rng = np.random.default_rng(seed); n = len(base)
     tot_m = np.zeros((n, simulations), dtype=np.float32)
     dwn_m = np.zeros((n, simulations), dtype=np.float32)
-    seqs = base["Sequence"].to_numpy(dtype=int)
-    sl  = np.array([lm[s]  for s in seqs], dtype=float)
-    sh  = np.array([hm[s]  for s in seqs], dtype=float)
-    swl = np.array([wvm[s] for s in seqs], dtype=float)
-    swd = np.array([wdm[s] for s in seqs], dtype=float)
-    sit = np.array([tm[s]  for s in seqs], dtype=bool)
-    # Per-row weather phase: loading rows (non-transit, in the loading block) use
-    # the loading-location dataset; everything else uses project weather.
-    s_is_loading = np.array([(s in loading_seq_set) and (not tm.get(s, False)) for s in seqs],
-                            dtype=bool)
+    # Loading-weather rows use the loading-location dataset; everything else
+    # uses project weather.
+    sl, sh, swl, swd, sit, s_is_loading = _timeline_step_arrays(timeline_df, transit_hours)
 
     def _wait(times, winds, waves, start, wlim, wndlim, check_w):
         idx = int(np.searchsorted(times, np.datetime64(pd.Timestamp(start)), side="left"))
@@ -2447,7 +2207,8 @@ else:
                     if vessel == "W90":
                         tl  = build_w90_timeline(io.BytesIO(excel_bytes), sheet, cap,
                                                   int(N_WTG), htd,
-                                                  dock_distance=td, transit_speed=spd)
+                                                  dock_distance=td, transit_speed=spd,
+                                                  vessel=vessel)
                         dur = add_duration_simulations_w90(
                             tl, io.BytesIO(excel_bytes), sheet,
                             simulations=int(Simulations), seed=42, htd=htd,
@@ -2455,7 +2216,8 @@ else:
                     else:
                         tl  = build_sequential_wtg_timeline(io.BytesIO(excel_bytes), sheet,
                                                              int(cap), int(N_WTG), htd,
-                                                             dock_distance=td, transit_speed=spd)
+                                                             dock_distance=td, transit_speed=spd,
+                                                             vessel=vessel)
                         dur = add_duration_simulations_sequential(
                             tl, io.BytesIO(excel_bytes), sheet,
                             simulations=int(Simulations),

@@ -51,28 +51,40 @@ Pure functions are defined inline between the UI code, so importing the file run
 
 Pipeline per case (vessel × loading mode × phase):
 
-1. **Workbook parsing** — `_excel_read` / `_resolve_sheet_name`, `_find_col`, `_norm_marker`,
-   `_norm_bool`. Sheet rows carry `N`, `Seq Dur (hrs)`, `Tr (hrs)`, `Transit`, `Loading` /
-   `Installation` START/END markers, `Oplim Waves (m)`, `Oplim Wind (m/s)` and `Parallell-1/2` flags.
-2. **Timeline builders** — expand the sheet into one row per executed step for the whole campaign:
-   `build_mp_timeline`, `build_jacket_timeline` (foundations), `build_w90_timeline` (parallel
-   loading), `build_sequential_wtg_timeline` (JUV/FIV). Transit rows use
-   `_mode_transit_distance(mode, ...)` / transit speed instead of sheet hours.
-3. **Durations** — `add_duration_simulations_w90` / `add_duration_simulations_sequential` draw
-   uniform durations between `Seq Dur` and `Tr`.
-4. **Weather** — `load_all_weather` merges project / barge / yard ZIPs; wind is
+1. **Workbook parsing** — `_excel_read` / `_resolve_sheet_name` (tolerates trailing spaces in
+   sheet names), then `_read_ops_sheet` normalises a sheet: `N`, `Seq Dur (hrs)` / `Tr (hrs)` →
+   lo/hi, `Transit`, `Loading` / `Installation` START/END markers, `Oplim Waves (m)`,
+   `Oplim Wind (m/s)` and `Parallell 1/2` flags.
+2. **Campaign plan** — `_sheet_blocks` splits a sheet into pre / load / mid / inst / post and
+   `_build_plan` (a port of `dd/sim_reference.build_plan`) repeats them per cycle or per unit;
+   parallel pairs take the longer duration and stricter limits. `_PLAN_OVERRIDES` holds
+   template workarounds per vessel (JUV rows 16–18 per turbine). `_plan_to_timeline` turns the
+   plan into the timeline DataFrame. The four `build_*_timeline` functions are thin wrappers
+   that keep their old signatures (`build_jacket_timeline` uses `barge_fed=True` and treats
+   transit rows after Installation END as in-field moves).
+3. **Timeline rows carry everything downstream needs**: `Lo_Hours`, `Hi_Hours`, `Transit`,
+   `Wave_Limit`, `Wind_Limit`, `Loading_Weather`, `Weather_Restricted`, `Block`, plus display
+   columns (`Sequence` = first sheet N, `Source_Sequences`, `Inventory`, `WTG_Left`, ...).
+   Duration and weather simulators read these via `_timeline_step_arrays`; they no longer look
+   rows up in the sheet (their `excel_src` / `sheet_name` args are unused). Transit rows get
+   `_mode_transit_distance(mode, ...)` / transit speed at simulation time.
+4. **Durations** — `add_duration_simulations_w90` / `_sequential` → `_add_duration_simulations`
+   (uniform Lo..Hi per row).
+5. **Weather** — `load_all_weather` merges project / barge / yard ZIPs; wind is
    `Adjusted_Windspeed = 0.9 × |u10,v10|`. `get_seasonal_eligible_indices` picks start hours around
    the start date; `simulate_weather_impacts_foundation`, `simulate_weather_impacts_w90`,
    `simulate_sequential_wtg_weather` step through the timeline and wait for workable weather
-   (nested `wait` helpers). Loading steps use loading-location weather (barge or yard by mode).
-5. **Output** — `build_project_summary`, `plot_*`, `build_simulation_excel_export`,
+   (nested `wait` helpers, start-hour check only). `Loading_Weather` rows use the loading-location
+   weather (yard wind-only / barge / project by loading mode). In the foundation phase loading
+   rows are not weather-restricted.
+6. **Output** — `build_project_summary`, `plot_*`, `build_simulation_excel_export`,
    `render_advanced_weather_intelligence`.
 
 Results are kept in `st.session_state` so that touching widgets after "Run All Simulations" does
 not wipe them (a `st.button` is only true on the click rerun).
 
-`htd = 1/24` converts hours to days; despite their names, columns like `Seq_Duration_Hours` in the
-W90 timeline hold days.
+`htd = 1/24` converts hours to days. `Sim*` matrices and `Seq_Duration_Days` are in days; despite
+the name, `Parallel_Branch_*_Hours` also holds days.
 
 ## Due-diligence reference (`dd/`)
 

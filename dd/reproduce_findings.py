@@ -35,9 +35,11 @@ KEEP = {"_find_col", "_norm_marker", "_norm_bool", "_resolve_sheet_name", "_exce
         "build_mp_timeline", "build_jacket_timeline", "simulate_weather_impacts_foundation",
         "get_seasonal_eligible_indices", "build_w90_timeline", "add_duration_simulations_w90",
         "build_sequential_wtg_timeline", "add_duration_simulations_sequential",
-        "simulate_weather_impacts_w90", "simulate_sequential_wtg_weather", "_sim_totals"}
+        "simulate_weather_impacts_w90", "simulate_sequential_wtg_weather", "_sim_totals",
+        "_read_ops_sheet", "_sheet_blocks", "_plan_step", "_build_plan", "_plan_to_timeline",
+        "_timeline_step_arrays", "_add_duration_simulations", "_wtg_plan_overrides"}
 CONSTS = {"_TIME_COLS", "_U_COLS", "_V_COLS", "_WAVE_MARKERS", "_WIND_MARKERS", "_DROP_COLS",
-          "_WAVE_HEIGHT_COLS"}
+          "_WAVE_HEIGHT_COLS", "_PLAN_OVERRIDES"}
 
 
 def load_app(path: str) -> dict:
@@ -125,11 +127,11 @@ def main():
                               ("W90 Jacket", 1, "jk", dict(barge_fed=True, infield_rows=(8,))),
                               ("JUV Jacket", 1, "jk", dict(barge_fed=True, infield_rows=(8,)))]:
         df = R.read_sheet(src(), sh)
-        exp = {int(r.N): (th if r.transit else 0.5 * (r.lo + r.hi)) for r in df.itertuples()}
-        if kind == "mp":
-            tl = ns["build_mp_timeline"](src(), sh, cap, N, htd); app_d = sum(exp[s] for s in tl["Sequence"]) / 24
-        elif kind == "jk":
-            tl = ns["build_jacket_timeline"](src(), sh, N, htd); app_d = sum(exp[s] for s in tl["Sequence"]) / 24
+        if kind in ("mp", "jk"):
+            tl = (ns["build_mp_timeline"](src(), sh, cap, N, htd) if kind == "mp"
+                  else ns["build_jacket_timeline"](src(), sh, N, htd))
+            mid = 0.5 * (tl["Lo_Hours"] + tl["Hi_Hours"])
+            app_d = float(np.where(tl["Transit"], th, mid).sum()) / 24
         elif kind == "w90":
             tl = ns["build_w90_timeline"](src(), sh, cap, N, htd, dock_distance=D, transit_speed=S)
             dur = ns["add_duration_simulations_w90"](tl, src(), sh, simulations=200, seed=42, htd=htd,
