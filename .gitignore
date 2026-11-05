@@ -1,0 +1,7 @@
+﻿# Project workbooks and weather data stay local
+*.xlsx
+*.xls
+*.zip
+era5_morven/
+__pycache__/
+.pytest_cache/
